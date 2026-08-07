@@ -4,6 +4,9 @@ node_modules/
 # Runtime workspace
 workspace/
 
+# Local Git worktrees
+.worktrees/
+
 # Environment variables
 .env
 
