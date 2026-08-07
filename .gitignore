@@ -124,3 +124,7 @@ data/tdai-memory.db
 # Test coverage output
 coverage/
 **/coverage/
+
+# Cross-agent memory local credentials and runtime data
+integrations/cross-agent-memory/config.local.json
+integrations/cross-agent-memory/runtime/

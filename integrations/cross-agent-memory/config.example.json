@@ -1,0 +1,14 @@
+{
+  "endpoint": "http://127.0.0.1:8420",
+  "apiKey": "example-only-not-a-real-key",
+  "serviceId": "default",
+  "identity": {
+    "teamId": "team-personal-memory",
+    "agentId": "agent-personal-assistant",
+    "userId": "user-jin-z",
+    "taskId": "task-cross-agent-chat"
+  },
+  "timeouts": { "recallMs": 1200, "captureMs": 3000 },
+  "recall": { "l0Limit": 3, "l1Limit": 5, "maxContextChars": 12000 },
+  "queue": { "retryBatchSize": 3, "retryBudgetMs": 800 }
+}
