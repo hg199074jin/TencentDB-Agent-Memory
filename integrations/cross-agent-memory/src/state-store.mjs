@@ -23,6 +23,11 @@ const LOCK_RETRY_MS = 10;
 const PENDING_LOCK_WAIT_MS = LOCK_ATTEMPTS * LOCK_RETRY_MS;
 const PENDING_CLEANUP_BUDGET_MS = 100;
 
+function remainingWait(deadline, defaultWaitMs) {
+  if (!Number.isFinite(deadline)) return defaultWaitMs;
+  return Math.max(0, Math.min(defaultWaitMs, deadline - Date.now()));
+}
+
 function sha256(value) {
   return createHash("sha256").update(String(value), "utf8").digest("hex");
 }
@@ -157,7 +162,7 @@ async function cleanPendingDigest(pendingDir, digest, fs, threshold) {
   }
 }
 
-async function cleanOrphanedPending(runtimeDir, injectedFs = {}) {
+async function cleanOrphanedPending(runtimeDir, injectedFs = {}, outerDeadline = Number.POSITIVE_INFINITY) {
   const fs = pendingFileSystem(injectedFs);
   const pendingDir = join(runtimeDir, "pending");
   let entries;
@@ -168,7 +173,7 @@ async function cleanOrphanedPending(runtimeDir, injectedFs = {}) {
     return;
   }
   const threshold = Date.now() - ORPHAN_AGE_MS;
-  const deadline = Date.now() + PENDING_CLEANUP_BUDGET_MS;
+  const deadline = Math.min(Date.now() + PENDING_CLEANUP_BUDGET_MS, outerDeadline);
   for (const entry of entries.filter((candidate) => candidate.isFile() && pendingTempDigest(candidate.name))) {
     if (Date.now() >= deadline) break;
     const temporary = join(pendingDir, entry.name);
@@ -219,9 +224,10 @@ async function logWarning(runtimeDir, code) {
   }
 }
 
-async function acquireQueueLock(runtimeDir) {
+async function acquireQueueLock(runtimeDir, waitMs = PENDING_LOCK_WAIT_MS) {
   const lockDir = join(runtimeDir, "capture-queue.lock");
-  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (let attempt = 0; attempt < LOCK_ATTEMPTS && Date.now() < deadline; attempt += 1) {
     try {
       await mkdir(lockDir);
       return lockDir;
@@ -235,7 +241,7 @@ async function acquireQueueLock(runtimeDir) {
       } catch {
         // Another process may have released the lock between checks.
       }
-      await sleep(LOCK_RETRY_MS);
+      await sleep(Math.min(LOCK_RETRY_MS, Math.max(0, deadline - Date.now())));
     }
   }
   return null;
@@ -441,8 +447,13 @@ export async function savePendingTurn(
   let lockDir;
   try {
     await mkdir(pendingDir, { recursive: true });
-    await cleanOrphanedPending(runtimeDir, options.fs);
-    lockDir = await acquirePendingLock(pendingDir, digest, options.fs);
+    await cleanOrphanedPending(runtimeDir, options.fs, options.deadline);
+    lockDir = await acquirePendingLock(
+      pendingDir,
+      digest,
+      options.fs,
+      remainingWait(options.deadline, PENDING_LOCK_WAIT_MS)
+    );
     if (!lockDir) return false;
     await writeDurable(temporary, JSON.stringify({
       client: String(client).toLowerCase(),
@@ -470,9 +481,17 @@ export async function takePendingTurn({ client, sourceSessionId }, options = {})
   let lockDir;
   let claimed = false;
   try {
-    lockDir = await acquirePendingLock(pendingDir, digest, options.fs);
+    lockDir = await acquirePendingLock(
+      pendingDir,
+      digest,
+      options.fs,
+      remainingWait(options.deadline, PENDING_LOCK_WAIT_MS)
+    );
     if (!lockDir) return null;
     await recoverClaimsForDigest(pendingDir, digest, fs, Date.now() - ORPHAN_AGE_MS);
+    if (options.consume === false) {
+      return JSON.parse(await fs.readFile(target, "utf8"));
+    }
     await fs.rename(target, claim);
     claimed = true;
     const pending = JSON.parse(await fs.readFile(claim, "utf8"));
@@ -497,7 +516,11 @@ export async function enqueueCapture(record, options = {}) {
     await mkdir(spoolDir, { recursive: true });
     await writeDurable(spoolPath, JSON.stringify(normalized));
     durable = true;
-    const lockDir = await acquireQueueLock(runtimeDir);
+    if (options.deferConsolidation === true) return true;
+    const lockDir = await acquireQueueLock(
+      runtimeDir,
+      remainingWait(options.deadline, PENDING_LOCK_WAIT_MS)
+    );
     if (!lockDir) return true;
     try {
       const result = await consolidateQueue(runtimeDir);
@@ -518,7 +541,10 @@ export async function drainCaptureQueue(limit, handler, options = {}) {
   let lockDir;
   try {
     await mkdir(runtimeDir, { recursive: true });
-    lockDir = await acquireQueueLock(runtimeDir);
+    lockDir = await acquireQueueLock(
+      runtimeDir,
+      remainingWait(options.deadline, PENDING_LOCK_WAIT_MS)
+    );
     if (!lockDir) return { processed: 0, removed: 0, remaining: 0, stopped: true };
     const consolidated = await consolidateQueue(runtimeDir);
     if (!consolidated.ok) {

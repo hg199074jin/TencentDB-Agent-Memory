@@ -91,6 +91,83 @@ test("pending turns are isolated by client, use digest-only filenames, and are c
   });
 });
 
+test("a non-consuming pending read supports repeated Stop and is overwritten only by the next matching submit", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const key = { client: "codex", sourceSessionId: "continued-session" };
+    await savePendingTurn({
+      ...key,
+      prompt: "continued prompt",
+      skip: false,
+      submittedAt: "2026-08-08T00:00:00.000Z"
+    }, { runtimeDir });
+
+    assert.equal((await takePendingTurn(key, { runtimeDir, consume: false })).prompt, "continued prompt");
+    assert.equal((await takePendingTurn(key, { runtimeDir, consume: false })).prompt, "continued prompt");
+    assert.equal(await takePendingTurn({
+      client: "codex",
+      sourceSessionId: "different-session"
+    }, { runtimeDir, consume: false }), null);
+
+    await savePendingTurn({
+      ...key,
+      prompt: "next prompt",
+      skip: false,
+      submittedAt: "2026-08-08T00:01:00.000Z"
+    }, { runtimeDir });
+    assert.equal((await takePendingTurn(key, { runtimeDir, consume: false })).prompt, "next prompt");
+  });
+});
+
+test("a caller deadline bounds pending-lock contention", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const key = { client: "codex", sourceSessionId: "deadline-pending" };
+    await savePendingTurn({
+      ...key,
+      prompt: "deadline prompt",
+      skip: false,
+      submittedAt: "2026-08-08T00:00:00.000Z"
+    }, { runtimeDir });
+    const [canonical] = (await readdir(join(runtimeDir, "pending")))
+      .filter((name) => name.endsWith(".json"));
+    await mkdir(join(runtimeDir, "pending", `${canonical.slice(0, -5)}.pending-lock`));
+
+    const started = Date.now();
+    assert.equal(await takePendingTurn(key, {
+      runtimeDir,
+      consume: false,
+      deadline: Date.now() + 50
+    }), null);
+    assert.ok(Date.now() - started < 250);
+  });
+});
+
+test("a caller deadline bounds queue-lock contention after the current capture is durable", async () => {
+  await withRuntime(async (runtimeDir) => {
+    await mkdir(join(runtimeDir, "capture-queue.lock"));
+    const started = Date.now();
+    assert.equal(await enqueueCapture(captureRecord("deadline queue"), {
+      runtimeDir,
+      deadline: Date.now() + 50
+    }), true);
+    assert.ok(Date.now() - started < 250);
+    const spoolNames = await readdir(join(runtimeDir, "capture-spool"));
+    assert.equal(spoolNames.length, 1);
+    assert.match(await readFile(join(runtimeDir, "capture-spool", spoolNames[0]), "utf8"), /deadline queue/);
+  });
+});
+
+test("a caller deadline bounds retry queue-lock contention", async () => {
+  await withRuntime(async (runtimeDir) => {
+    await mkdir(join(runtimeDir, "capture-queue.lock"));
+    const started = Date.now();
+    assert.deepEqual(await drainCaptureQueue(3, async () => true, {
+      runtimeDir,
+      deadline: Date.now() + 50
+    }), { processed: 0, removed: 0, remaining: 0, stopped: true });
+    assert.ok(Date.now() - started < 250);
+  });
+});
+
 test("makeMemorySessionId prefixes a normalized client and the first 24 SHA-256 hex characters", () => {
   const source = "用户原始 session id";
   const digest = createHash("sha256").update(source, "utf8").digest("hex").slice(0, 24);

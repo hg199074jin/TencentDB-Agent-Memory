@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
@@ -99,6 +99,41 @@ test("captureTurn queues a sanitized write failure and fails open", async () => 
       { role: "assistant", content: "assistant content", timestamp: "2026-08-08T00:00:01.000Z" }
     ]);
     assert.equal(JSON.stringify(queued[0]).includes("must-not-leak"), false);
+  });
+});
+
+test("captureTurn aborts a request by the aggregate deadline and durably spools the current turn", async () => {
+  await withRuntime(async (runtimeDir) => {
+    let receivedSignal;
+    const started = Date.now();
+    const result = await captureTurn({
+      ...turn,
+      runtimeDir,
+      deadline: Date.now() + 900,
+      gatewayClient: {
+        addConversation: async (_sessionId, _messages, signal) => {
+          receivedSignal = signal;
+          await new Promise((resolveWait, reject) => {
+            const timer = setTimeout(resolveWait, 350);
+            signal?.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(new Error("aborted"));
+            }, { once: true });
+          });
+        }
+      }
+    });
+
+    assert.equal(receivedSignal instanceof AbortSignal, true);
+    assert.deepEqual(result, { captured: false, queued: true });
+    assert.ok(Date.now() - started < 300);
+    const spoolNames = await readdir(join(runtimeDir, "capture-spool"));
+    assert.equal(spoolNames.length, 1);
+    const durable = JSON.parse(await readFile(join(runtimeDir, "capture-spool", spoolNames[0]), "utf8"));
+    assert.deepEqual(durable.messages.map(({ role, content }) => ({ role, content })), [
+      { role: "user", content: "user content" },
+      { role: "assistant", content: "assistant content" }
+    ]);
   });
 });
 

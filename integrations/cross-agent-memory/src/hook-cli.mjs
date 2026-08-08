@@ -7,13 +7,18 @@ import { fileURLToPath } from "node:url";
 import { captureTurn, retryQueuedCaptures } from "./capture.mjs";
 import { loadConfig } from "./config.mjs";
 import { GatewayClient } from "./gateway-client.mjs";
-import { hasNoMemoryDirective } from "./privacy.mjs";
+import { inspectTurn } from "./privacy.mjs";
 import { recallCrossSession } from "./recall.mjs";
 import { savePendingTurn, takePendingTurn } from "./state-store.mjs";
 
 const CLIENTS = new Set(["codex", "claude", "zcode"]);
 const RUNTIME_DIR = fileURLToPath(new URL("../runtime/", import.meta.url));
 const STATUS_LOG = join(RUNTIME_DIR, "logs", "status.jsonl");
+const PROCESS_STARTED_AT = Date.now();
+const PROCESS_BUDGET_MS = 4_200;
+const FINALIZATION_RESERVE_MS = 150;
+const RETRY_START_RESERVE_MS = 900;
+const WORK_DEADLINE = PROCESS_STARTED_AT + PROCESS_BUDGET_MS - FINALIZATION_RESERVE_MS;
 
 function sessionDigest(value) {
   if (typeof value !== "string" || value === "") return "none";
@@ -55,21 +60,37 @@ function sourceSessionId(input) {
   return typeof input?.session_id === "string" ? input.session_id : "";
 }
 
-async function userPromptSubmit(client, input) {
+function configWithinDeadline(config, deadline) {
+  const remaining = Math.max(1, deadline - Date.now());
+  return {
+    ...config,
+    timeouts: {
+      recallMs: Math.min(config.timeouts.recallMs, remaining),
+      captureMs: Math.min(config.timeouts.captureMs, remaining)
+    }
+  };
+}
+
+async function userPromptSubmit(client, input, deadline) {
   const sessionId = sourceSessionId(input);
   const prompt = typeof input.prompt === "string" ? input.prompt : "";
-  const skip = hasNoMemoryDirective(prompt);
+  const inspected = inspectTurn(prompt, "");
+  const skip = inspected.skip;
   await savePendingTurn({
     client,
     sourceSessionId: sessionId,
-    prompt,
+    prompt: skip ? "" : inspected.user,
     skip,
     submittedAt: new Date().toISOString()
-  });
+  }, { deadline });
   if (skip) return { output: {}, status: "opt-out" };
 
   const config = await loadConfig();
-  const additionalContext = await recallCrossSession(new GatewayClient(config), prompt, config.recall);
+  const additionalContext = await recallCrossSession(
+    new GatewayClient(configWithinDeadline(config, deadline)),
+    inspected.user,
+    config.recall
+  );
   if (!additionalContext) return { output: {}, status: "recall-empty" };
   return {
     output: {
@@ -82,9 +103,13 @@ async function userPromptSubmit(client, input) {
   };
 }
 
-async function stop(client, input) {
+async function stop(client, input, deadline) {
   const sessionId = sourceSessionId(input);
-  const pending = await takePendingTurn({ client, sourceSessionId: sessionId });
+  const pending = await takePendingTurn(
+    { client, sourceSessionId: sessionId },
+    { consume: false, deadline }
+  );
+  if (pending?.skip) return { output: {}, status: "opt-out" };
   let capture = { captured: false, queued: false, skipped: true };
   const captureCurrentTurn = (gatewayClient) => captureTurn({
     gatewayClient,
@@ -94,14 +119,15 @@ async function stop(client, input) {
     assistant: typeof input.last_assistant_message === "string" ? input.last_assistant_message : "",
     submittedAt: pending.submittedAt,
     completedAt: new Date().toISOString(),
-    runtimeDir: RUNTIME_DIR
+    runtimeDir: RUNTIME_DIR,
+    deadline
   });
 
   let config;
   let gatewayClient;
   try {
     config = await loadConfig();
-    gatewayClient = new GatewayClient(config);
+    gatewayClient = new GatewayClient(configWithinDeadline(config, deadline));
   } catch {
     if (pending && !pending.skip) {
       capture = await captureCurrentTurn({
@@ -114,12 +140,15 @@ async function stop(client, input) {
   if (pending && !pending.skip) {
     capture = await captureCurrentTurn(gatewayClient);
   }
-  const retry = await retryQueuedCaptures({
-    gatewayClient,
-    retryBatchSize: config.queue.retryBatchSize,
-    retryBudgetMs: Math.min(config.queue.retryBudgetMs, 800),
-    runtimeDir: RUNTIME_DIR
-  });
+  const retry = deadline - Date.now() >= RETRY_START_RESERVE_MS
+    ? await retryQueuedCaptures({
+        gatewayClient,
+        retryBatchSize: config.queue.retryBatchSize,
+        retryBudgetMs: Math.min(config.queue.retryBudgetMs, 800),
+        runtimeDir: RUNTIME_DIR,
+        deadline
+      })
+    : { budgetExceeded: deadline <= Date.now() };
   const captureStatus = capture.captured ? "captured" : capture.queued ? "queued" : "skipped";
   return {
     output: {},
@@ -127,13 +156,13 @@ async function stop(client, input) {
   };
 }
 
-async function handle(client, input) {
+async function handle(client, input, deadline) {
   if (!CLIENTS.has(client)) return { output: {}, status: "invalid-client" };
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     return { output: {}, status: "invalid-input" };
   }
-  if (input.hook_event_name === "UserPromptSubmit") return userPromptSubmit(client, input);
-  if (input.hook_event_name === "Stop") return stop(client, input);
+  if (input.hook_event_name === "UserPromptSubmit") return userPromptSubmit(client, input, deadline);
+  if (input.hook_event_name === "Stop") return stop(client, input, deadline);
   return { output: {}, status: "unknown-event" };
 }
 
@@ -148,7 +177,7 @@ try {
   const input = JSON.parse(await readInputLine());
   event = eventName(input?.hook_event_name);
   session = sessionDigest(sourceSessionId(input));
-  const result = await handle(client, input);
+  const result = await handle(client, input, WORK_DEADLINE);
   output = result.output;
   status = result.status;
 } catch (error) {

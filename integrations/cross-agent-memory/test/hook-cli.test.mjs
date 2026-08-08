@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import {
@@ -38,8 +38,13 @@ async function startGateway() {
   const server = createServer(async (request, response) => {
     const body = await readRequestBody(request);
     requests.push({ path: request.url, body });
-    if (body.query === "hang request private prompt" ||
-        request.url === "/v3/conversation/query" && body.session_id === "codex-hanging-old-record") {
+    if (
+      body.query === "hang request private prompt" ||
+      body.query === "default deadline current prompt" ||
+      (request.url === "/v3/conversation/add" &&
+        body.messages?.[0]?.content === "default deadline current prompt") ||
+      (request.url === "/v3/conversation/query" && body.session_id === "codex-hanging-old-record")
+    ) {
       hangingResponses.add(response);
       response.on("close", () => {
         hangingResponses.delete(response);
@@ -130,9 +135,43 @@ async function queuedRecords() {
   return source.trimEnd().split("\n").map((line) => JSON.parse(line));
 }
 
+async function durableCaptureRecords() {
+  const records = [];
+  try {
+    records.push(...await queuedRecords());
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  try {
+    for (const name of await readdir(join(runtimeDir, "capture-spool"))) {
+      records.push(JSON.parse(await readFile(join(runtimeDir, "capture-spool", name), "utf8")));
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return records;
+}
+
 async function clearQueue() {
   await rm(join(runtimeDir, "capture-queue.jsonl"), { force: true });
   await rm(join(runtimeDir, "capture-spool"), { recursive: true, force: true });
+}
+
+async function pendingRecord(client, sourceSessionId) {
+  const digest = createHash("sha256")
+    .update(`${client.toLowerCase()}\0${sourceSessionId}`, "utf8")
+    .digest("hex");
+  return JSON.parse(await readFile(join(runtimeDir, "pending", `${digest}.json`), "utf8"));
+}
+
+async function runtimeText(path = runtimeDir) {
+  let output = "";
+  for (const entry of await readdir(path, { withFileTypes: true })) {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) output += await runtimeText(child);
+    else output += await readFile(child, "utf8");
+  }
+  return output;
 }
 
 function primaryFirst(primaryError, cleanupErrors, message) {
@@ -229,6 +268,18 @@ test("shared hook CLI preserves the three-client process contract and fails open
       queue: { retryBatchSize: 3, retryBudgetMs: 800 }
     }), "utf8");
 
+    const writeDefaultConfig = () => writeFile(configPath, JSON.stringify({
+      endpoint: gateway.endpoint,
+      apiKey,
+      serviceId: "test-service",
+      identity: {
+        teamId: "test-team",
+        agentId: "test-agent",
+        userId: "test-user",
+        taskId: "test-task"
+      }
+    }), "utf8");
+
     await writeConfig();
     for (const client of ["codex", "claude", "zcode"]) {
       const sessionId = `${client}-${randomUUID()}`;
@@ -275,6 +326,112 @@ test("shared hook CLI preserves the three-client process contract and fails open
       assert.equal(stop.stdout, "{}\n");
       assert.equal(gateway.requests.length, before);
     }
+
+    for (const [label, privateSkippedPrompt] of [
+      ["directive", "/nomemory OPT-OUT-SENTINEL-4091"],
+      ["credential", "api_key=CREDENTIAL-SENTINEL-7812"]
+    ]) {
+      const sessionId = `${label}-${randomUUID()}`;
+      await runHook("codex", JSON.stringify({
+        session_id: sessionId,
+        hook_event_name: "UserPromptSubmit",
+        prompt: `stale ${label} prompt that must be overwritten`
+      }));
+      await enqueueCapture({
+        memorySessionId: `codex-private-skip-old-${label}`,
+        messages: [
+          { role: "user", content: `old queued ${label} prompt`, timestamp: "2026-08-08T00:00:00.000Z" },
+          { role: "assistant", content: `old queued ${label} answer`, timestamp: "2026-08-08T00:00:01.000Z" }
+        ]
+      }, { runtimeDir });
+      const before = gateway.requests.length;
+      const submit = await runHook("codex", JSON.stringify({
+        session_id: sessionId,
+        hook_event_name: "UserPromptSubmit",
+        prompt: privateSkippedPrompt
+      }));
+      stderrOutputs.push(submit.stderr);
+      assert.deepEqual(submit.output, {});
+      assert.equal(gateway.requests.length, before);
+      const savedMarker = await pendingRecord("codex", sessionId);
+      assert.deepEqual({
+        client: savedMarker.client,
+        prompt: savedMarker.prompt,
+        skip: savedMarker.skip
+      }, {
+        client: "codex",
+        prompt: "",
+        skip: true
+      });
+      assert.equal(Number.isFinite(new Date(savedMarker.submittedAt).getTime()), true);
+      await runHook("codex", JSON.stringify({
+        session_id: sessionId,
+        hook_event_name: "Stop",
+        last_assistant_message: `answer for ${label} must also be skipped`
+      }));
+      assert.equal(gateway.requests.length, before);
+      const persistedRuntime = await runtimeText();
+      assert.equal(persistedRuntime.includes(privateSkippedPrompt), false);
+      await clearQueue();
+    }
+
+    const continuationSession = `continuation-${randomUUID()}`;
+    await runHook("codex", JSON.stringify({
+      session_id: continuationSession,
+      hook_event_name: "UserPromptSubmit",
+      prompt: "continuation current prompt"
+    }));
+    gateway.requests.length = 0;
+    await runHook("codex", JSON.stringify({
+      session_id: continuationSession,
+      hook_event_name: "Stop",
+      stop_hook_active: false,
+      last_assistant_message: "continuation intermediate answer"
+    }));
+    await runHook("codex", JSON.stringify({
+      session_id: continuationSession,
+      hook_event_name: "Stop",
+      stop_hook_active: true,
+      last_assistant_message: "continuation final answer"
+    }));
+    const continuationWrites = gateway.requests.filter((item) => item.path === "/v3/conversation/add");
+    assert.deepEqual(continuationWrites.map((item) => item.body.messages.map(({ role, content }) => ({ role, content }))), [
+      [
+        { role: "user", content: "continuation current prompt" },
+        { role: "assistant", content: "continuation intermediate answer" }
+      ],
+      [
+        { role: "user", content: "continuation current prompt" },
+        { role: "assistant", content: "continuation final answer" }
+      ]
+    ]);
+
+    gateway.requests.length = 0;
+    await runHook("codex", JSON.stringify({
+      session_id: `wrong-session-${randomUUID()}`,
+      hook_event_name: "Stop",
+      stop_hook_active: true,
+      last_assistant_message: "must not pair with continuation prompt"
+    }));
+    assert.equal(gateway.requests.some((item) => item.path === "/v3/conversation/add"), false);
+
+    await runHook("codex", JSON.stringify({
+      session_id: continuationSession,
+      hook_event_name: "UserPromptSubmit",
+      prompt: "next prompt overwrites continuation"
+    }));
+    gateway.requests.length = 0;
+    await runHook("codex", JSON.stringify({
+      session_id: continuationSession,
+      hook_event_name: "Stop",
+      stop_hook_active: false,
+      last_assistant_message: "next final answer"
+    }));
+    const nextWrite = gateway.requests.find((item) => item.path === "/v3/conversation/add");
+    assert.deepEqual(nextWrite.body.messages.map(({ role, content }) => ({ role, content })), [
+      { role: "user", content: "next prompt overwrites continuation" },
+      { role: "assistant", content: "next final answer" }
+    ]);
 
     const orderedSession = `ordered-${randomUUID()}`;
     const orderedSubmit = await runHook("codex", JSON.stringify({
@@ -366,6 +523,50 @@ test("shared hook CLI preserves the three-client process contract and fails open
     assert.equal(hanging.stdout, "{}\n");
     assert.ok(Date.now() - hangingStarted < 5_000);
 
+    await clearQueue();
+    await writeDefaultConfig();
+    const deadlineSession = `default-deadline-${randomUUID()}`;
+    await runHook("codex", JSON.stringify({
+      session_id: deadlineSession,
+      hook_event_name: "UserPromptSubmit",
+      prompt: "default deadline current prompt"
+    }));
+    const pendingDigest = createHash("sha256")
+      .update(`codex\0${deadlineSession}`, "utf8")
+      .digest("hex");
+    const pendingLock = join(runtimeDir, "pending", `${pendingDigest}.pending-lock`);
+    const queueLock = join(runtimeDir, "capture-queue.lock");
+    await mkdir(pendingLock);
+    await mkdir(queueLock);
+    const releasePending = setTimeout(() => {
+      void rm(pendingLock, { recursive: true, force: true });
+    }, 550);
+    const deadlineStarted = Date.now();
+    let deadlineStop;
+    try {
+      deadlineStop = await runHook("codex", JSON.stringify({
+        session_id: deadlineSession,
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+        last_assistant_message: "default deadline current answer"
+      }), 4_900);
+    } finally {
+      clearTimeout(releasePending);
+      await rm(pendingLock, { recursive: true, force: true });
+      await rm(queueLock, { recursive: true, force: true });
+    }
+    const deadlineElapsed = Date.now() - deadlineStarted;
+    stderrOutputs.push(deadlineStop.stderr);
+    assert.equal(deadlineStop.stdout, "{}\n");
+    assert.ok(deadlineElapsed < 4_500, `default-contention Stop took ${deadlineElapsed}ms`);
+    const spoolNames = await readdir(join(runtimeDir, "capture-spool"));
+    const durableCurrentTurn = await Promise.all(spoolNames.map(async (name) =>
+      JSON.parse(await readFile(join(runtimeDir, "capture-spool", name), "utf8"))));
+    assert.equal(durableCurrentTurn.some((record) =>
+      record.messages?.[0]?.content === "default deadline current prompt" &&
+      record.messages?.[1]?.content === "default deadline current answer"), true);
+    await clearQueue();
+
     for (const [client, source] of [
       ["codex", "not JSON"],
       ["claude", JSON.stringify({ session_id: "unknown", hook_event_name: "UnknownEvent", prompt: privatePrompt })],
@@ -407,7 +608,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
       }));
       stderrOutputs.push(configSubmit.stderr, stopped.stderr);
       assert.equal(stopped.stdout, "{}\n");
-      const queued = (await queuedRecords()).at(-1);
+      const queued = (await durableCaptureRecords()).at(-1);
       assert.deepEqual(queued.messages.map(({ role, content }) => ({ role, content })), [
         { role: "user", content: `${configCase} current prompt` },
         { role: "assistant", content: `${configCase} current answer` }

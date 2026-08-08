@@ -7,6 +7,7 @@ import {
 
 const MAX_RETRY_BATCH = 3;
 const DEDUPE_WINDOW_MS = 2_000;
+const DURABLE_SPOOL_RESERVE_MS = 700;
 
 function isoTimestamp(value, fallback) {
   const timestamp = new Date(value ?? fallback);
@@ -65,7 +66,8 @@ export async function captureTurn({
   assistant,
   submittedAt,
   completedAt,
-  runtimeDir
+  runtimeDir,
+  deadline
 }) {
   try {
     const inspected = inspectTurn(user, assistant);
@@ -78,10 +80,21 @@ export async function captureTurn({
     ];
     const memorySessionId = makeMemorySessionId(client, sourceSessionId);
     try {
-      await gatewayClient.addConversation(memorySessionId, messages);
+      if (Number.isFinite(deadline)) {
+        const write = await withinDeadline(
+          (signal) => gatewayClient.addConversation(memorySessionId, messages, signal),
+          deadline - DURABLE_SPOOL_RESERVE_MS
+        );
+        if (write.status !== "fulfilled") throw write.error ?? new Error("capture deadline");
+      } else {
+        await gatewayClient.addConversation(memorySessionId, messages);
+      }
       return { captured: true, queued: false };
     } catch {
-      const queued = await enqueueCapture({ memorySessionId, messages }, { runtimeDir });
+      const queued = await enqueueCapture(
+        { memorySessionId, messages },
+        { runtimeDir, deadline, deferConsolidation: Number.isFinite(deadline) }
+      );
       return { captured: false, queued };
     }
   } catch {
@@ -93,15 +106,22 @@ export async function retryQueuedCaptures({
   gatewayClient,
   retryBatchSize = 3,
   retryBudgetMs = 800,
-  runtimeDir
+  runtimeDir,
+  deadline: aggregateDeadline
 }) {
   const batchSize = Math.min(
     Number.isInteger(retryBatchSize) && retryBatchSize > 0 ? retryBatchSize : MAX_RETRY_BATCH,
     MAX_RETRY_BATCH
   );
   const budgetMs = Number.isFinite(retryBudgetMs) && retryBudgetMs > 0 ? retryBudgetMs : 800;
-  const deadline = Date.now() + budgetMs;
-  let budgetExceeded = false;
+  const deadline = Math.min(
+    Date.now() + budgetMs,
+    Number.isFinite(aggregateDeadline) ? aggregateDeadline : Number.POSITIVE_INFINITY
+  );
+  let budgetExceeded = Date.now() >= deadline;
+  if (budgetExceeded) {
+    return { processed: 0, removed: 0, remaining: 0, budgetExceeded: true };
+  }
   try {
     const result = await drainCaptureQueue(batchSize, async (record) => {
       if (Date.now() >= deadline) {
@@ -128,7 +148,7 @@ export async function retryQueuedCaptures({
         return false;
       }
       return write.status === "fulfilled";
-    }, { runtimeDir });
+    }, { runtimeDir, deadline });
 
     return {
       processed: result.processed,
