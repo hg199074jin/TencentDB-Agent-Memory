@@ -30,44 +30,49 @@ export class GatewayClient {
     };
   }
 
-  async searchConversation(query, limit) {
-    return this.#post("/v3/conversation/search", { query, limit }, this.config.timeouts.recallMs);
+  async searchConversation(query, limit, signal) {
+    return this.#post("/v3/conversation/search", { query, limit }, this.config.timeouts.recallMs, signal);
   }
 
-  async queryConversation(sessionId, limit = 20) {
+  async queryConversation(sessionId, limit = 20, signal) {
     if (typeof sessionId !== "string" || sessionId.trim() === "") {
       throw requestError("missing query session");
     }
     return this.#post(
       "/v3/conversation/query",
       { session_id: sessionId, limit },
-      this.config.timeouts.recallMs
+      this.config.timeouts.recallMs,
+      signal
     );
   }
 
-  async searchAtomic(query, limit) {
-    return this.#post("/v3/atomic/search", { query, limit }, this.config.timeouts.recallMs);
+  async searchAtomic(query, limit, signal) {
+    return this.#post("/v3/atomic/search", { query, limit }, this.config.timeouts.recallMs, signal);
   }
 
-  async readCore() {
-    return this.#post("/v3/core/read", {}, this.config.timeouts.recallMs);
+  async readCore(signal) {
+    return this.#post("/v3/core/read", {}, this.config.timeouts.recallMs, signal);
   }
 
-  async addConversation(sessionId, messages) {
+  async addConversation(sessionId, messages, signal) {
     if (typeof sessionId !== "string" || sessionId.trim() === "") {
       throw requestError("missing write session");
     }
     return this.#post(
       "/v3/conversation/add",
       { session_id: sessionId, messages },
-      this.config.timeouts.captureMs
+      this.config.timeouts.captureMs,
+      signal
     );
   }
 
-  async #post(path, request, timeoutMs) {
+  async #post(path, request, timeoutMs, externalSignal) {
     const { identity } = this.config;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const cancel = () => controller.abort(externalSignal?.reason);
+    if (externalSignal?.aborted) cancel();
+    else externalSignal?.addEventListener("abort", cancel, { once: true });
     try {
       let response;
       try {
@@ -118,6 +123,7 @@ export class GatewayClient {
       return envelope.data;
     } finally {
       clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", cancel);
     }
   }
 }

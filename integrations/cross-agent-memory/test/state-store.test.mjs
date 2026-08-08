@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, readdir, rename as fsRename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
@@ -34,6 +34,17 @@ function captureRecord(content, timestamp = "2026-08-08T00:00:00.000Z") {
       { role: "user", content, timestamp },
       { role: "assistant", content: `reply:${content}`, timestamp: "2026-08-08T00:00:01.000Z" }
     ]
+  };
+}
+
+function storedCaptureRecord(content) {
+  const record = { ...captureRecord(content), queuedAt: "2026-08-08T00:00:02.000Z" };
+  return {
+    ...record,
+    digest: createHash("sha256").update(JSON.stringify({
+      memorySessionId: record.memorySessionId,
+      messages: record.messages
+    }), "utf8").digest("hex")
   };
 }
 
@@ -102,6 +113,69 @@ test("a later hook removes orphaned pending turns older than seven days", async 
   });
 });
 
+test("takePendingTurn claims the old state before a concurrent save and cannot unlink the new state", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const key = { client: "codex", sourceSessionId: "race" };
+    await savePendingTurn({ ...key, prompt: "old", skip: false, submittedAt: "2026-08-08T00:00:00.000Z" }, { runtimeDir });
+    let releaseClaim;
+    const claimed = new Promise((resolveClaimed) => {
+      releaseClaim = resolveClaimed;
+    });
+    let continueTake;
+    const mayRead = new Promise((resolveRead) => { continueTake = resolveRead; });
+    const take = takePendingTurn(key, {
+      runtimeDir,
+      fs: {
+        rename: async (from, to) => {
+          await fsRename(from, to);
+          releaseClaim();
+          await mayRead;
+        }
+      }
+    });
+    await claimed;
+    await savePendingTurn({ ...key, prompt: "new", skip: false, submittedAt: "2026-08-08T00:00:01.000Z" }, { runtimeDir });
+    continueTake();
+
+    assert.equal((await take).prompt, "old");
+    assert.equal((await takePendingTurn(key, { runtimeDir })).prompt, "new");
+  });
+});
+
+test("orphan cleanup deletes only its stale claim and preserves a concurrently saved canonical state", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const key = { client: "codex", sourceSessionId: "cleanup-race" };
+    await savePendingTurn({ ...key, prompt: "old", skip: false, submittedAt: "2026-07-01T00:00:00.000Z" }, { runtimeDir });
+    const [oldName] = await readdir(join(runtimeDir, "pending"));
+    const oldTime = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    await utimes(join(runtimeDir, "pending", oldName), oldTime, oldTime);
+    let releaseClaim;
+    const claimed = new Promise((resolveClaimed) => { releaseClaim = resolveClaimed; });
+    let continueCleanup;
+    const mayClean = new Promise((resolveClean) => { continueCleanup = resolveClean; });
+    const cleaningHook = savePendingTurn({
+      client: "codex", sourceSessionId: "trigger", prompt: "trigger", skip: false, submittedAt: new Date().toISOString()
+    }, {
+      runtimeDir,
+      fs: {
+        rename: async (from, to) => {
+          await fsRename(from, to);
+          if (from.endsWith(oldName)) {
+            releaseClaim();
+            await mayClean;
+          }
+        }
+      }
+    });
+    await claimed;
+    await savePendingTurn({ ...key, prompt: "new", skip: false, submittedAt: new Date().toISOString() }, { runtimeDir });
+    continueCleanup();
+    await cleaningHook;
+
+    assert.equal((await takePendingTurn(key, { runtimeDir })).prompt, "new");
+  });
+});
+
 test("enqueueCapture persists one JSON object per line without unrelated secrets", async () => {
   await withRuntime(async (runtimeDir) => {
     const queued = await enqueueCapture({
@@ -144,13 +218,13 @@ test("concurrent hook processes append without overwriting either record", async
   });
 });
 
-test("a later enqueue recovers a rebuild file retained after an atomic replace failure", async () => {
+test("a later enqueue recovers a complete ready rebuild retained after an atomic replace failure", async () => {
   await withRuntime(async (runtimeDir) => {
-    const oldRecord = captureRecord("old");
-    const retainedRecord = captureRecord("retained");
+    const oldRecord = storedCaptureRecord("old");
+    const retainedRecord = storedCaptureRecord("retained");
     await writeFile(join(runtimeDir, "capture-queue.jsonl"), `${JSON.stringify(oldRecord)}\n`, "utf8");
     await writeFile(
-      join(runtimeDir, ".capture-queue-rebuild-crashed.tmp"),
+      join(runtimeDir, ".capture-queue-rebuild-crashed.ready"),
       `${JSON.stringify(oldRecord)}\n${JSON.stringify(retainedRecord)}\n`,
       "utf8"
     );
@@ -159,7 +233,50 @@ test("a later enqueue recovers a rebuild file retained after an atomic replace f
 
     const lines = (await readFile(join(runtimeDir, "capture-queue.jsonl"), "utf8")).trim().split("\n");
     assert.deepEqual(lines.map((line) => JSON.parse(line).messages[0].content), ["old", "retained", "new"]);
-    assert.equal((await readdir(runtimeDir)).some((name) => name.startsWith(".capture-queue-rebuild-")), false);
+    assert.equal((await readdir(runtimeDir)).some((name) => name.endsWith(".ready")), false);
+  });
+});
+
+test("partial building and invalid ready artifacts never replace the canonical queue", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const canonical = storedCaptureRecord("canonical");
+    await writeFile(join(runtimeDir, "capture-queue.jsonl"), `${JSON.stringify(canonical)}\n`, "utf8");
+    await writeFile(join(runtimeDir, ".capture-queue-rebuild-interrupted.building"), '{"partial":', "utf8");
+    await writeFile(join(runtimeDir, ".capture-queue-rebuild-invalid.ready"), '{"invalid":true}\n', "utf8");
+
+    assert.equal(await enqueueCapture(captureRecord("new"), { runtimeDir }), true);
+
+    const queue = (await readFile(join(runtimeDir, "capture-queue.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(queue[0].messages[0].content, "canonical");
+    assert.equal(queue.some((record) => record.messages?.[0]?.content === "new"), true);
+    await assert.rejects(() => access(join(runtimeDir, ".capture-queue-rebuild-interrupted.building")));
+    assert.equal((await readdir(runtimeDir)).some((name) => name.endsWith(".invalid")), true);
+  });
+});
+
+test("a ready artifact is preserved when the real filesystem cannot replace the canonical path", async () => {
+  await withRuntime(async (runtimeDir) => {
+    await mkdir(join(runtimeDir, "capture-queue.jsonl"));
+    const readyPath = join(runtimeDir, ".capture-queue-rebuild-blocked.ready");
+    await writeFile(readyPath, `${JSON.stringify(storedCaptureRecord("ready"))}\n`, "utf8");
+
+    assert.equal(await enqueueCapture(captureRecord("new"), { runtimeDir }), true);
+    assert.equal((await stat(join(runtimeDir, "capture-queue.jsonl"))).isDirectory(), true);
+    assert.equal((await stat(readyPath)).isFile(), true);
+  });
+});
+
+test("caller-supplied equal digests cannot collapse distinct normalized captures", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const forged = "a".repeat(64);
+    await enqueueCapture({ ...captureRecord("first"), digest: forged }, { runtimeDir });
+    await enqueueCapture({ ...captureRecord("second"), digest: forged }, { runtimeDir });
+    const records = [];
+    await drainCaptureQueue(3, async (record) => { records.push(record); return true; }, { runtimeDir });
+
+    assert.deepEqual(records.map((record) => record.messages[0].content), ["first", "second"]);
+    assert.notEqual(records[0].digest, records[1].digest);
+    assert.equal(records.some((record) => record.digest === forged), false);
   });
 });
 

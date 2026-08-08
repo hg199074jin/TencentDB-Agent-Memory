@@ -40,15 +40,19 @@ function isDuplicate(messages, queuedMessages) {
 function withinDeadline(operation, deadline) {
   const remaining = deadline - Date.now();
   if (remaining <= 0) return Promise.resolve({ status: "timeout" });
+  const controller = new AbortController();
   let timer;
   const operationResult = Promise.resolve()
-    .then(operation)
+    .then(() => operation(controller.signal))
     .then(
       (value) => ({ status: "fulfilled", value }),
       (error) => ({ status: "rejected", error })
     );
   const timeout = new Promise((resolve) => {
-    timer = setTimeout(() => resolve({ status: "timeout" }), remaining);
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve({ status: "timeout" });
+    }, remaining);
   });
   return Promise.race([operationResult, timeout]).finally(() => clearTimeout(timer));
 }
@@ -106,7 +110,7 @@ export async function retryQueuedCaptures({
       }
 
       const query = await withinDeadline(
-        () => gatewayClient.queryConversation(record.memorySessionId, 20),
+        (signal) => gatewayClient.queryConversation(record.memorySessionId, 20, signal),
         deadline
       );
       if (query.status === "timeout") {
@@ -116,7 +120,7 @@ export async function retryQueuedCaptures({
       if (query.status === "fulfilled" && isDuplicate(query.value?.messages, record.messages)) return true;
 
       const write = await withinDeadline(
-        () => gatewayClient.addConversation(record.memorySessionId, record.messages),
+        (signal) => gatewayClient.addConversation(record.memorySessionId, record.messages, signal),
         deadline
       );
       if (write.status === "timeout") {

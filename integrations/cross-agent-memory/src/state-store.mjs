@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   appendFile,
+  link,
   mkdir,
   open,
   readFile,
@@ -46,26 +47,45 @@ async function removeIfExists(path) {
   }
 }
 
-async function cleanOrphanedPending(runtimeDir) {
+async function cleanOrphanedPending(runtimeDir, injectedFs = {}) {
+  const fs = { readdir, rename, stat, unlink, link, ...injectedFs };
   const pendingDir = join(runtimeDir, "pending");
   let entries;
   try {
-    entries = await readdir(pendingDir, { withFileTypes: true });
+    entries = await fs.readdir(pendingDir, { withFileTypes: true });
   } catch (error) {
     if (error?.code !== "ENOENT") return;
     return;
   }
   const threshold = Date.now() - ORPHAN_AGE_MS;
-  await Promise.all(entries
-    .filter((entry) => entry.isFile() && /^[a-f0-9]{64}\.json$/.test(entry.name))
-    .map(async (entry) => {
-      const path = join(pendingDir, entry.name);
-      try {
-        if ((await stat(path)).mtimeMs < threshold) await unlink(path);
-      } catch {
-        // Cleanup must never break a Hook.
+  for (const entry of entries.filter((candidate) => candidate.isFile() && /^[a-f0-9]{64}\.json$/.test(candidate.name))) {
+    const canonical = join(pendingDir, entry.name);
+    const claim = join(pendingDir, `.${entry.name}.${process.pid}.${randomUUID()}.cleanup-claim`);
+    try {
+      await fs.rename(canonical, claim);
+    } catch {
+      continue;
+    }
+    try {
+      if ((await fs.stat(claim)).mtimeMs < threshold) {
+        await fs.unlink(claim);
+        continue;
       }
-    }));
+      try {
+        await fs.link(claim, canonical);
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+      }
+      await fs.unlink(claim);
+    } catch {
+      try {
+        await fs.link(claim, canonical);
+        await fs.unlink(claim);
+      } catch {
+        // A newer canonical wins; otherwise a later cleanup can recover the claim.
+      }
+    }
+  }
 }
 
 async function writeDurable(path, source) {
@@ -138,10 +158,23 @@ function normalizeCapture(record) {
     messages: cleanMessages(record?.messages),
     queuedAt: typeof record?.queuedAt === "string" ? record.queuedAt : new Date().toISOString()
   };
-  const digest = typeof record?.digest === "string" && /^[a-f0-9]{64}$/.test(record.digest)
-    ? record.digest
-    : sha256(JSON.stringify({ memorySessionId: core.memorySessionId, messages: core.messages }));
+  const digest = sha256(JSON.stringify({ memorySessionId: core.memorySessionId, messages: core.messages }));
   return { ...core, digest };
+}
+
+function isValidQueuedRecord(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+  if (typeof record.memorySessionId !== "string" || record.memorySessionId === "") return false;
+  if (typeof record.queuedAt !== "string" || !Number.isFinite(new Date(record.queuedAt).getTime())) return false;
+  if (!Array.isArray(record.messages) || record.messages.length === 0) return false;
+  if (!record.messages.every((message) =>
+    message && typeof message === "object" && !Array.isArray(message) &&
+    typeof message.role === "string" && typeof message.content === "string" &&
+    typeof message.timestamp === "string" && Number.isFinite(new Date(message.timestamp).getTime()))) return false;
+  return record.digest === sha256(JSON.stringify({
+    memorySessionId: record.memorySessionId,
+    messages: record.messages
+  }));
 }
 
 async function readQueue(queuePath) {
@@ -165,10 +198,13 @@ function queueSource(records) {
 
 async function replaceQueue(runtimeDir, records) {
   const queuePath = join(runtimeDir, "capture-queue.jsonl");
-  const temporaryPath = join(runtimeDir, `.capture-queue-rebuild-${process.pid}-${randomUUID()}.tmp`);
-  await writeDurable(temporaryPath, queueSource(records));
+  const token = `${process.pid}-${randomUUID()}`;
+  const buildingPath = join(runtimeDir, `.capture-queue-rebuild-${token}.building`);
+  const readyPath = join(runtimeDir, `.capture-queue-rebuild-${token}.ready`);
+  await writeDurable(buildingPath, queueSource(records));
+  await rename(buildingPath, readyPath);
   try {
-    await rename(temporaryPath, queuePath);
+    await rename(readyPath, queuePath);
     return true;
   } catch {
     await logWarning(runtimeDir, "capture_queue_replace_failed");
@@ -191,27 +227,48 @@ async function pendingQueueFiles(runtimeDir) {
 async function recoverRetainedRebuild(runtimeDir) {
   let names;
   try {
-    names = (await readdir(runtimeDir))
-      .filter((name) => name.startsWith(".capture-queue-rebuild-") && name.endsWith(".tmp"));
+    names = await readdir(runtimeDir);
   } catch (error) {
     if (error?.code === "ENOENT") return true;
     throw error;
   }
-  if (names.length === 0) return true;
+  const buildingNames = names.filter((name) =>
+    name.startsWith(".capture-queue-rebuild-") && name.endsWith(".building"));
+  await Promise.all(buildingNames.map(async (name) => {
+    try { await removeIfExists(join(runtimeDir, name)); } catch { /* Never promote incomplete builds. */ }
+  }));
+  const readyNames = names.filter((name) =>
+    name.startsWith(".capture-queue-rebuild-") && name.endsWith(".ready"));
+  if (readyNames.length === 0) return true;
 
-  const candidates = await Promise.all(names.map(async (name) => {
+  const candidates = await Promise.all(readyNames.map(async (name) => {
     const path = join(runtimeDir, name);
     return { path, mtimeMs: (await stat(path)).mtimeMs };
   }));
-  candidates.sort((left, right) => left.mtimeMs - right.mtimeMs);
-  const newest = candidates.at(-1);
+  const validCandidates = [];
+  for (const candidate of candidates) {
+    try {
+      const source = await readFile(candidate.path, "utf8");
+      if (source !== "" && !source.endsWith("\n")) throw new Error("incomplete JSONL");
+      const lines = source === "" ? [] : source.slice(0, -1).split("\n");
+      if (lines.some((line) => line === "")) throw new Error("blank JSONL record");
+      const records = lines.map((line) => JSON.parse(line));
+      if (!records.every(isValidQueuedRecord)) throw new Error("invalid queue record");
+      validCandidates.push(candidate);
+    } catch {
+      try { await rename(candidate.path, `${candidate.path}.invalid`); } catch { /* Preserve in place if quarantine fails. */ }
+    }
+  }
+  if (validCandidates.length === 0) return true;
+  validCandidates.sort((left, right) => left.mtimeMs - right.mtimeMs);
+  const newest = validCandidates.at(-1);
   try {
     await rename(newest.path, join(runtimeDir, "capture-queue.jsonl"));
   } catch {
     await logWarning(runtimeDir, "capture_queue_recovery_failed");
     return false;
   }
-  await Promise.all(candidates.slice(0, -1).map(async ({ path }) => {
+  await Promise.all(validCandidates.slice(0, -1).map(async ({ path }) => {
     try { await removeIfExists(path); } catch { /* Obsolete recovery files contain no new data. */ }
   }));
   return true;
@@ -274,7 +331,7 @@ export async function savePendingTurn(
   const temporary = join(pendingDir, `${digest}.${process.pid}.${randomUUID()}.tmp`);
   try {
     await mkdir(pendingDir, { recursive: true });
-    await cleanOrphanedPending(runtimeDir);
+    await cleanOrphanedPending(runtimeDir, options.fs);
     await writeDurable(temporary, JSON.stringify({
       client: String(client).toLowerCase(),
       prompt: typeof prompt === "string" ? prompt : "",
@@ -292,10 +349,13 @@ export async function savePendingTurn(
 export async function takePendingTurn({ client, sourceSessionId }, options = {}) {
   const runtimeDir = runtimePath(options);
   const target = join(runtimeDir, "pending", `${pendingDigest(client, sourceSessionId)}.json`);
+  const claim = join(runtimeDir, "pending", `.${pendingDigest(client, sourceSessionId)}.${process.pid}.${randomUUID()}.take-claim`);
+  const fs = { rename, readFile, unlink, ...options.fs };
   try {
-    await cleanOrphanedPending(runtimeDir);
-    const pending = JSON.parse(await readFile(target, "utf8"));
-    await unlink(target);
+    await fs.rename(target, claim);
+    await cleanOrphanedPending(runtimeDir, options.fs);
+    const pending = JSON.parse(await fs.readFile(claim, "utf8"));
+    await fs.unlink(claim);
     return pending;
   } catch {
     return null;

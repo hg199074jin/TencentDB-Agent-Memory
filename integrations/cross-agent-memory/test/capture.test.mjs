@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { createServer } from "node:http";
+import { spawn } from "node:child_process";
 import { captureTurn, retryQueuedCaptures } from "../src/capture.mjs";
 import { drainCaptureQueue, enqueueCapture } from "../src/state-store.mjs";
 
@@ -24,6 +27,23 @@ const turn = {
   submittedAt: "2026-08-08T00:00:00.000Z",
   completedAt: "2026-08-08T00:00:01.000Z"
 };
+
+function waitForChild(child, timeoutMs) {
+  return new Promise((resolveChild, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("child exceeded retry lifecycle budget"));
+    }, timeoutMs);
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      code === 0 ? resolveChild() : reject(new Error(stderr || `child exited ${code}`));
+    });
+  });
+}
 
 test("captureTurn skips a credential-bearing turn before any gateway write", async () => {
   await withRuntime(async (runtimeDir) => {
@@ -173,5 +193,42 @@ test("retryQueuedCaptures processes at most three records and honors its total t
     assert.ok(Date.now() - started < 130);
     assert.deepEqual(writes, ["codex-0"]);
     assert.deepEqual(result, { processed: 1, removed: 0, remaining: 4, budgetExceeded: true });
+  });
+});
+
+test("a child process aborts a real hanging gateway request and exits within the Hook budget", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const server = createServer(() => {});
+    await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
+    const endpoint = `http://127.0.0.1:${server.address().port}`;
+    const captureUrl = pathToFileURL(join(resolve(import.meta.dirname, ".."), "src", "capture.mjs")).href;
+    const gatewayUrl = pathToFileURL(join(resolve(import.meta.dirname, ".."), "src", "gateway-client.mjs")).href;
+    const stateUrl = pathToFileURL(join(resolve(import.meta.dirname, ".."), "src", "state-store.mjs")).href;
+    const script = `
+      import { retryQueuedCaptures } from ${JSON.stringify(captureUrl)};
+      import { GatewayClient } from ${JSON.stringify(gatewayUrl)};
+      import { enqueueCapture } from ${JSON.stringify(stateUrl)};
+      const runtimeDir = process.env.TEST_RUNTIME;
+      await enqueueCapture({ memorySessionId: "codex-hanging", messages: [
+        { role: "user", content: "hang", timestamp: "2026-08-08T00:00:00.000Z" }
+      ] }, { runtimeDir });
+      const gatewayClient = new GatewayClient({ endpoint: process.env.TEST_ENDPOINT, apiKey: "test-key", serviceId: "default",
+        identity: { teamId: "team", agentId: "agent", userId: "user", taskId: "task" },
+        timeouts: { recallMs: 5000, captureMs: 5000 } });
+      const result = await retryQueuedCaptures({ gatewayClient, retryBatchSize: 1, retryBudgetMs: 80, runtimeDir });
+      if (!result.budgetExceeded) process.exitCode = 2;
+    `;
+    const started = Date.now();
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+      env: { ...process.env, TEST_RUNTIME: runtimeDir, TEST_ENDPOINT: endpoint },
+      stdio: ["ignore", "ignore", "pipe"]
+    });
+    try {
+      await waitForChild(child, 800);
+      assert.ok(Date.now() - started < 800);
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolveClose) => server.close(resolveClose));
+    }
   });
 });

@@ -156,6 +156,22 @@ test("GatewayClient uses the capture timeout for conversation writes", async () 
   });
 });
 
+test("GatewayClient aborts a hanging request from an external signal before its own timeout", async () => {
+  await withGateway(() => {}, async (clientConfig) => {
+    const controller = new AbortController();
+    const client = new GatewayClient({
+      ...clientConfig,
+      timeouts: { recallMs: 5_000, captureMs: 5_000 }
+    });
+    const started = Date.now();
+    const request = client.queryConversation("codex-session", 20, controller.signal);
+    setTimeout(() => controller.abort(), 40);
+
+    await assert.rejects(request, /failed|cancel|abort/i);
+    assert.ok(Date.now() - started < 500);
+  });
+});
+
 test("GatewayClient rejects missing or blank connection and identity configuration before a request", () => {
   const missingFields = [
     ["endpoint", (value, replacement) => { value.endpoint = replacement; }],
