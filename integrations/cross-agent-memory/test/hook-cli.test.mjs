@@ -33,13 +33,24 @@ async function readRequestBody(request) {
 
 async function startGateway() {
   const requests = [];
+  const abortedRequests = [];
   const hangingResponses = new Set();
   const server = createServer(async (request, response) => {
     const body = await readRequestBody(request);
     requests.push({ path: request.url, body });
-    if (body.query === "hang request private prompt") {
+    if (body.query === "hang request private prompt" ||
+        request.url === "/v3/conversation/query" && body.session_id === "codex-hanging-old-record") {
       hangingResponses.add(response);
-      response.on("close", () => hangingResponses.delete(response));
+      response.on("close", () => {
+        hangingResponses.delete(response);
+        abortedRequests.push({ path: request.url, body });
+      });
+      return;
+    }
+    if (request.url === "/v3/conversation/add" &&
+        body.messages?.[0]?.content === "capture failure current prompt") {
+      response.writeHead(503, { "Content-Type": "application/json" });
+      response.end(envelope({ accepted: false }));
       return;
     }
     response.writeHead(200, { "Content-Type": "application/json" });
@@ -59,6 +70,7 @@ async function startGateway() {
   return {
     endpoint: `http://127.0.0.1:${server.address().port}`,
     requests,
+    abortedRequests,
     async close() {
       for (const response of hangingResponses) response.destroy();
       await new Promise((resolve) => server.close(resolve));
@@ -84,15 +96,14 @@ async function runHook(client, input, timeoutMs = 4_500) {
     child.on("error", reject);
     child.on("close", (code) => {
       clearTimeout(timer);
-      const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
       let output;
       try {
         assert.equal(code, 0, `stderr: ${stderr}`);
-        assert.equal(lines.length, 1, `stdout: ${stdout}`);
-        output = JSON.parse(lines[0]);
+        output = JSON.parse(stdout);
         assert.equal(typeof output, "object");
         assert.notEqual(output, null);
         assert.equal(Array.isArray(output), false);
+        assert.equal(stdout, `${JSON.stringify(output)}\n`);
       } catch (error) {
         reject(error);
         return;
@@ -114,55 +125,110 @@ function isSharedRuntimeEntry(name) {
   ]).has(name) || name.startsWith(".capture-queue-rebuild-");
 }
 
+async function queuedRecords() {
+  const source = await readFile(join(runtimeDir, "capture-queue.jsonl"), "utf8");
+  return source.trimEnd().split("\n").map((line) => JSON.parse(line));
+}
+
+async function clearQueue() {
+  await rm(join(runtimeDir, "capture-queue.jsonl"), { force: true });
+  await rm(join(runtimeDir, "capture-spool"), { recursive: true, force: true });
+}
+
+function primaryFirst(primaryError, cleanupErrors, message) {
+  if (primaryError && cleanupErrors.length > 0) {
+    return new AggregateError([primaryError, ...cleanupErrors], message);
+  }
+  if (primaryError) return primaryError;
+  if (cleanupErrors.length === 1) return cleanupErrors[0];
+  if (cleanupErrors.length > 1) return new AggregateError(cleanupErrors, message);
+  return null;
+}
+
+async function runCleanups(primaryError, cleanups, message) {
+  const cleanupErrors = [];
+  for (const cleanup of cleanups) {
+    try { await cleanup(); } catch (error) { cleanupErrors.push(error); }
+  }
+  const failure = primaryFirst(primaryError, cleanupErrors, message);
+  if (failure) throw failure;
+}
+
 async function isolateAdapterState() {
   await mkdir(runtimeDir, { recursive: true });
   const backupDir = join(runtimeDir, `.hook-cli-test-backup-${process.pid}-${randomUUID()}`);
   await mkdir(backupDir);
-  for (const name of await readdir(runtimeDir)) {
-    if (!isSharedRuntimeEntry(name)) continue;
-    await rename(join(runtimeDir, name), join(backupDir, name));
-  }
-  try {
-    await rename(configPath, join(backupDir, "config.local.json"));
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-  return async () => {
-    for (const name of await readdir(runtimeDir)) {
-      if (isSharedRuntimeEntry(name)) await rm(join(runtimeDir, name), { recursive: true, force: true });
+  let prepared = false;
+  const restore = async () => {
+    const cleanupErrors = [];
+    if (prepared) {
+      let runtimeNames = [];
+      try { runtimeNames = await readdir(runtimeDir); } catch (error) { cleanupErrors.push(error); }
+      for (const name of runtimeNames.filter(isSharedRuntimeEntry)) {
+        try { await rm(join(runtimeDir, name), { recursive: true, force: true }); }
+        catch (error) { cleanupErrors.push(error); }
+      }
+      try { await rm(configPath, { force: true }); } catch (error) { cleanupErrors.push(error); }
     }
-    try { await rm(configPath, { force: true }); } catch { /* Best effort cleanup. */ }
-    for (const name of await readdir(backupDir)) {
-      if (name === "config.local.json") await rename(join(backupDir, name), configPath);
-      else await rename(join(backupDir, name), join(runtimeDir, name));
+    let backupNames = [];
+    try { backupNames = await readdir(backupDir); } catch (error) { cleanupErrors.push(error); }
+    for (const name of backupNames) {
+      const destination = name === "config.local.json" ? configPath : join(runtimeDir, name);
+      try { await rename(join(backupDir, name), destination); }
+      catch (error) { cleanupErrors.push(error); }
     }
-    await rm(backupDir, { recursive: true, force: true });
+    if (cleanupErrors.length === 0) {
+      try { await rm(backupDir, { recursive: true, force: true }); }
+      catch (error) { cleanupErrors.push(error); }
+    }
+    const failure = primaryFirst(null, cleanupErrors, "adapter state restoration failed");
+    if (failure) throw failure;
   };
+
+  try {
+    for (const name of await readdir(runtimeDir)) {
+      if (!isSharedRuntimeEntry(name)) continue;
+      await rename(join(runtimeDir, name), join(backupDir, name));
+    }
+    try {
+      await rename(configPath, join(backupDir, "config.local.json"));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    prepared = true;
+    return restore;
+  } catch (error) {
+    await runCleanups(error, [restore], "adapter isolation and restoration failed");
+    throw error;
+  }
 }
 
 test("shared hook CLI preserves the three-client process contract and fails open without leaking content", async () => {
-  const restore = await isolateAdapterState();
-  const gateway = await startGateway();
-  const privatePrompt = "please retain PRIVATE-PROMPT-7193";
-  const privateAssistant = "PRIVATE-ASSISTANT-2841";
-  const apiKey = "PRIVATE-API-KEY-6637";
-  const stderrOutputs = [];
-  const writeConfig = () => writeFile(configPath, JSON.stringify({
-    endpoint: gateway.endpoint,
-    apiKey,
-    serviceId: "test-service",
-    identity: {
-      teamId: "test-team",
-      agentId: "test-agent",
-      userId: "test-user",
-      taskId: "test-task"
-    },
-    timeouts: { recallMs: 1_000, captureMs: 1_000 },
-    recall: { l0Limit: 3, l1Limit: 5, maxContextChars: 2_000 },
-    queue: { retryBatchSize: 3, retryBudgetMs: 800 }
-  }), "utf8");
-
+  let restore;
+  let gateway;
+  let primaryError;
   try {
+    restore = await isolateAdapterState();
+    gateway = await startGateway();
+    const privatePrompt = "please retain PRIVATE-PROMPT-7193";
+    const privateAssistant = "PRIVATE-ASSISTANT-2841";
+    const apiKey = "PRIVATE-API-KEY-6637";
+    const stderrOutputs = [];
+    const writeConfig = () => writeFile(configPath, JSON.stringify({
+      endpoint: gateway.endpoint,
+      apiKey,
+      serviceId: "test-service",
+      identity: {
+        teamId: "test-team",
+        agentId: "test-agent",
+        userId: "test-user",
+        taskId: "test-task"
+      },
+      timeouts: { recallMs: 1_000, captureMs: 1_000 },
+      recall: { l0Limit: 3, l1Limit: 5, maxContextChars: 2_000 },
+      queue: { retryBatchSize: 3, retryBudgetMs: 800 }
+    }), "utf8");
+
     await writeConfig();
     for (const client of ["codex", "claude", "zcode"]) {
       const sessionId = `${client}-${randomUUID()}`;
@@ -185,6 +251,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
       }));
       stderrOutputs.push(stopped.stderr);
       assert.deepEqual(stopped.output, {});
+      assert.equal(stopped.stdout, "{}\n");
       assert.equal(gateway.requests.some((item) => item.body.session_id?.startsWith(`${client}-`)), true);
     }
 
@@ -204,6 +271,8 @@ test("shared hook CLI preserves the three-client process contract and fails open
       stderrOutputs.push(submit.stderr, stop.stderr);
       assert.deepEqual(submit.output, {});
       assert.deepEqual(stop.output, {});
+      assert.equal(submit.stdout, "{}\n");
+      assert.equal(stop.stdout, "{}\n");
       assert.equal(gateway.requests.length, before);
     }
 
@@ -227,6 +296,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
       last_assistant_message: "current ordered answer"
     }));
     assert.deepEqual(orderedStop.output, {});
+    assert.equal(orderedStop.stdout, "{}\n");
     assert.deepEqual(gateway.requests.map((item) => item.path), [
       "/v3/conversation/add",
       "/v3/conversation/query",
@@ -236,6 +306,51 @@ test("shared hook CLI preserves the three-client process contract and fails open
     assert.equal(gateway.requests[0].body.messages[1].content, "current ordered answer");
     assert.equal(gateway.requests[2].body.messages[0].content, "old queued prompt");
 
+    const captureFailureSession = `capture-failure-${randomUUID()}`;
+    await runHook("codex", JSON.stringify({
+      session_id: captureFailureSession,
+      hook_event_name: "UserPromptSubmit",
+      prompt: "capture failure current prompt"
+    }));
+    const captureFailure = await runHook("codex", JSON.stringify({
+      session_id: captureFailureSession,
+      hook_event_name: "Stop",
+      last_assistant_message: "capture failure current answer"
+    }));
+    assert.equal(captureFailure.stdout, "{}\n");
+    assert.deepEqual((await queuedRecords()).at(-1).messages.map(({ role, content }) => ({ role, content })), [
+      { role: "user", content: "capture failure current prompt" },
+      { role: "assistant", content: "capture failure current answer" }
+    ]);
+    await clearQueue();
+
+    const retryHangSession = `retry-hang-${randomUUID()}`;
+    await runHook("codex", JSON.stringify({
+      session_id: retryHangSession,
+      hook_event_name: "UserPromptSubmit",
+      prompt: "retry hang current prompt"
+    }));
+    await enqueueCapture({
+      memorySessionId: "codex-hanging-old-record",
+      messages: [
+        { role: "user", content: "hanging old prompt", timestamp: "2026-08-08T00:00:00.000Z" },
+        { role: "assistant", content: "hanging old answer", timestamp: "2026-08-08T00:00:01.000Z" }
+      ]
+    }, { runtimeDir });
+    const retryStarted = Date.now();
+    const retryHang = await runHook("codex", JSON.stringify({
+      session_id: retryHangSession,
+      hook_event_name: "Stop",
+      last_assistant_message: "retry hang current answer"
+    }));
+    const retryElapsed = Date.now() - retryStarted;
+    assert.equal(retryHang.stdout, "{}\n");
+    assert.ok(retryElapsed >= 650 && retryElapsed < 2_000, `retry took ${retryElapsed}ms`);
+    assert.equal(gateway.abortedRequests.some((item) =>
+      item.path === "/v3/conversation/query" && item.body.session_id === "codex-hanging-old-record"), true);
+    assert.equal((await queuedRecords()).some((record) => record.memorySessionId === "codex-hanging-old-record"), true);
+    await clearQueue();
+
     const hangingStarted = Date.now();
     const hanging = await runHook("zcode", JSON.stringify({
       session_id: `hang-${randomUUID()}`,
@@ -244,6 +359,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
     }));
     stderrOutputs.push(hanging.stderr);
     assert.deepEqual(hanging.output, {});
+    assert.equal(hanging.stdout, "{}\n");
     assert.ok(Date.now() - hangingStarted < 5_000);
 
     for (const [client, source] of [
@@ -254,6 +370,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
       const result = await runHook(client, source);
       stderrOutputs.push(result.stderr);
       assert.deepEqual(result.output, {});
+      assert.equal(result.stdout, "{}\n");
     }
 
     await rm(configPath, { force: true });
@@ -264,6 +381,34 @@ test("shared hook CLI preserves the three-client process contract and fails open
     }));
     stderrOutputs.push(missingConfig.stderr);
     assert.deepEqual(missingConfig.output, {});
+    assert.equal(missingConfig.stdout, "{}\n");
+
+    for (const [configCase, configSource] of [
+      ["missing-stop-config", null],
+      ["invalid-stop-config", "{}"]
+    ]) {
+      await writeConfig();
+      const sessionId = `${configCase}-${randomUUID()}`;
+      await runHook("claude", JSON.stringify({
+        session_id: sessionId,
+        hook_event_name: "UserPromptSubmit",
+        prompt: `${configCase} current prompt`
+      }));
+      if (configSource === null) await rm(configPath, { force: true });
+      else await writeFile(configPath, configSource, "utf8");
+      const stopped = await runHook("claude", JSON.stringify({
+        session_id: sessionId,
+        hook_event_name: "Stop",
+        last_assistant_message: `${configCase} current answer`
+      }));
+      assert.equal(stopped.stdout, "{}\n");
+      const queued = (await queuedRecords()).at(-1);
+      assert.deepEqual(queued.messages.map(({ role, content }) => ({ role, content })), [
+        { role: "user", content: `${configCase} current prompt` },
+        { role: "assistant", content: `${configCase} current answer` }
+      ]);
+      await clearQueue();
+    }
 
     const logSource = await readFile(join(runtimeDir, "logs", "status.jsonl"), "utf8");
     const diagnostics = `${stderrOutputs.join("")}\n${logSource}`;
@@ -277,9 +422,12 @@ test("shared hook CLI preserves the three-client process contract and fails open
       ]);
       assert.match(record.session, /^(?:[a-f0-9]{16}|none)$/);
     }
+  } catch (error) {
+    primaryError = error;
   } finally {
-    await writeConfig().catch(() => {});
-    await gateway.close();
-    await restore();
+    await runCleanups(primaryError, [
+      async () => { if (gateway) await gateway.close(); },
+      async () => { if (restore) await restore(); }
+    ], "hook process test and cleanup failed");
   }
 });

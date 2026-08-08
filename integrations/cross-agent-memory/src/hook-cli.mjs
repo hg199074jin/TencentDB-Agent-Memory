@@ -85,20 +85,34 @@ async function userPromptSubmit(client, input) {
 async function stop(client, input) {
   const sessionId = sourceSessionId(input);
   const pending = await takePendingTurn({ client, sourceSessionId: sessionId });
-  const config = await loadConfig();
-  const gatewayClient = new GatewayClient(config);
   let capture = { captured: false, queued: false, skipped: true };
+  const captureCurrentTurn = (gatewayClient) => captureTurn({
+    gatewayClient,
+    client,
+    sourceSessionId: sessionId,
+    user: pending.prompt,
+    assistant: typeof input.last_assistant_message === "string" ? input.last_assistant_message : "",
+    submittedAt: pending.submittedAt,
+    completedAt: new Date().toISOString(),
+    runtimeDir: RUNTIME_DIR
+  });
+
+  let config;
+  let gatewayClient;
+  try {
+    config = await loadConfig();
+    gatewayClient = new GatewayClient(config);
+  } catch {
+    if (pending && !pending.skip) {
+      capture = await captureCurrentTurn({
+        addConversation: async () => { throw new Error("Gateway unavailable"); }
+      });
+    }
+    return { output: {}, status: capture.queued ? "queued" : "skipped" };
+  }
+
   if (pending && !pending.skip) {
-    capture = await captureTurn({
-      gatewayClient,
-      client,
-      sourceSessionId: sessionId,
-      user: pending.prompt,
-      assistant: typeof input.last_assistant_message === "string" ? input.last_assistant_message : "",
-      submittedAt: pending.submittedAt,
-      completedAt: new Date().toISOString(),
-      runtimeDir: RUNTIME_DIR
-    });
+    capture = await captureCurrentTurn(gatewayClient);
   }
   const retry = await retryQueuedCaptures({
     gatewayClient,
