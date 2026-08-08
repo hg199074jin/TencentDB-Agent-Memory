@@ -87,10 +87,12 @@ async function withGateway(handler, run) {
   if (cleanupError) throw cleanupError;
 }
 
-test("bootstrap reads only the local deployment credential and writes the fixed shared identity", async () => {
+test("secured bootstrap uses the Gateway Bearer from .env and never the admin user_key", async () => {
   await withSandbox(async ({ adapterRoot, deployDir }) => {
-    const credential = "test-only-placeholder";
-    await writeText(join(deployDir, ".admin-key"), credential);
+    const credential = "gateway-bearer-test-placeholder";
+    const adminUserKey = "admin-user-key-must-not-be-used";
+    await writeText(join(deployDir, ".admin-key"), adminUserKey);
+    await writeText(join(deployDir, ".env"), `MEMORY_CORE_GATEWAY_API_KEY=${credential}\n`);
     let verifiedConfig;
 
     const result = await bootstrapConfig({
@@ -115,6 +117,32 @@ test("bootstrap reads only the local deployment credential and writes the fixed 
     });
     assert.deepEqual(verifiedConfig.identity, FIXED_IDENTITY);
     assert.equal(formatBootstrapResult(result).includes(credential), false);
+    assert.equal(formatBootstrapResult(result).includes(adminUserKey), false);
+    assert.equal(result.credentialMode, "gateway-bearer");
+  });
+});
+
+test("explicitly disabled Bearer gate uses a non-secret local compatibility fallback", async () => {
+  await withSandbox(async ({ adapterRoot, deployDir }) => {
+    await writeText(join(deployDir, ".admin-key"), "admin-user-key-not-bearer");
+    await writeText(join(deployDir, ".env"), "MEMORY_CORE_GATEWAY_API_KEY= # explicitly disabled for local proxy compatibility\n");
+    let verifiedConfig;
+    const result = await bootstrapConfig({
+      adapterRoot,
+      deployDir,
+      gatewayFactory(config) {
+        verifiedConfig = config;
+        return { readCore: async () => ({}) };
+      }
+    });
+
+    const config = JSON.parse(await readFile(join(adapterRoot, "config.local.json"), "utf8"));
+    assert.equal(result.credentialMode, "bearer-disabled-local-fallback");
+    assert.equal(config.apiKey, verifiedConfig.apiKey);
+    assert.match(config.apiKey, /bearer.*disabled|disabled.*bearer/i);
+    assert.equal(config.apiKey.includes("admin-user-key-not-bearer"), false);
+    assert.match(formatBootstrapResult(result), /Bearer gate 已显式关闭/);
+    assert.equal(formatBootstrapResult(result).includes("认证材料已配置"), false);
   });
 });
 
@@ -141,7 +169,7 @@ test("force backs up the exact original bytes before replacing the config", asyn
     const original = Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0xff, 0x7d, 0x0d, 0x0a]);
     await mkdir(adapterRoot, { recursive: true });
     await writeFile(join(adapterRoot, "config.local.json"), original);
-    await writeText(join(deployDir, ".admin-key"), "replacement-test-placeholder");
+    await writeText(join(deployDir, ".env"), "MEMORY_CORE_GATEWAY_API_KEY=replacement-test-placeholder\n");
 
     const result = await bootstrapConfig({
       adapterRoot,
@@ -168,7 +196,7 @@ test("a rename failure preserves the original parseable config and its exact bac
     }, null, 2)}\r\n`, "utf8");
     await mkdir(adapterRoot, { recursive: true });
     await writeFile(join(adapterRoot, "config.local.json"), original);
-    await writeText(join(deployDir, ".admin-key"), "new-test-placeholder");
+    await writeText(join(deployDir, ".env"), "MEMORY_CORE_GATEWAY_API_KEY=new-test-placeholder\n");
     const now = () => new Date("2026-08-08T02:03:04.000Z");
 
     await assert.rejects(bootstrapConfig({
@@ -194,19 +222,40 @@ test("a rename failure preserves the original parseable config and its exact bac
   });
 });
 
-test("bootstrap stops without guessing when the deployment credential is missing", async () => {
+test("bootstrap stops actionably when the deployment .env or Gateway key declaration is missing", async () => {
   await withSandbox(async ({ adapterRoot, deployDir }) => {
     await assert.rejects(
       bootstrapConfig({ adapterRoot, deployDir }),
-      /deployment credential.*\.admin-key/i
+      /deployment.*\.env/i
     );
     await assert.rejects(readFile(join(adapterRoot, "config.local.json"), "utf8"), { code: "ENOENT" });
+
+    await writeText(join(deployDir, ".env"), "MEMORY_CORE_PORT=8420\n");
+    await assert.rejects(
+      bootstrapConfig({ adapterRoot, deployDir }),
+      /MEMORY_CORE_GATEWAY_API_KEY.*explicit/i
+    );
+  });
+});
+
+test("malformed Gateway key declarations fail without exposing Gateway or admin secrets", async () => {
+  await withSandbox(async ({ adapterRoot, deployDir }) => {
+    const gatewaySecret = "unterminated-gateway-secret";
+    const adminSecret = "admin-user-secret";
+    await writeText(join(deployDir, ".admin-key"), adminSecret);
+    await writeText(join(deployDir, ".env"), `MEMORY_CORE_GATEWAY_API_KEY="${gatewaySecret}\n`);
+
+    await assert.rejects(
+      bootstrapConfig({ adapterRoot, deployDir }),
+      (error) => /MEMORY_CORE_GATEWAY_API_KEY.*invalid/i.test(error.message) &&
+        !error.message.includes(gatewaySecret) && !error.message.includes(adminSecret)
+    );
   });
 });
 
 test("bootstrap verifies strict isolation before writing and leaves no config on failure", async () => {
   await withSandbox(async ({ adapterRoot, deployDir }) => {
-    await writeText(join(deployDir, ".admin-key"), "verification-test-placeholder");
+    await writeText(join(deployDir, ".env"), "MEMORY_CORE_GATEWAY_API_KEY=verification-test-placeholder\n");
     await assert.rejects(
       bootstrapConfig({
         adapterRoot,
@@ -231,8 +280,9 @@ test("bootstrap CLI emits exact actionable sanitized results for success and fou
   }, async (port) => {
     await withSandbox(async ({ adapterRoot, deployDir }) => {
       const credential = "cli-success-test-placeholder";
-      await writeText(join(deployDir, ".admin-key"), credential);
-      await writeText(join(deployDir, ".env"), `MEMORY_CORE_PORT=${port}\n`);
+      const adminUserKey = "cli-admin-user-key";
+      await writeText(join(deployDir, ".admin-key"), adminUserKey);
+      await writeText(join(deployDir, ".env"), `MEMORY_CORE_PORT=${port}\nMEMORY_CORE_GATEWAY_API_KEY=${credential}\n`);
       const result = await runCli({ adapterRoot, deployDir });
       assert.deepEqual(result, {
         code: 0,
@@ -240,6 +290,7 @@ test("bootstrap CLI emits exact actionable sanitized results for success and fou
         stderr: ""
       });
       assert.equal(`${result.stdout}${result.stderr}`.includes(credential), false);
+      assert.equal(`${result.stdout}${result.stderr}`.includes(adminUserKey), false);
     });
   });
 
@@ -261,13 +312,12 @@ test("bootstrap CLI emits exact actionable sanitized results for success and fou
     assert.deepEqual(await runCli({ adapterRoot, deployDir }), {
       code: 1,
       stdout: "",
-      stderr: "[FAIL] 配置未写入：缺少本地部署凭据 .admin-key。\n"
+      stderr: "[FAIL] 配置未写入：缺少本地部署配置 deploy/global-images/.env。\n"
     });
   });
 
   await withSandbox(async ({ adapterRoot, deployDir }) => {
-    await writeText(join(deployDir, ".admin-key"), "invalid-port-test-placeholder");
-    await writeText(join(deployDir, ".env"), "MEMORY_CORE_PORT=not-a-port\n");
+    await writeText(join(deployDir, ".env"), "MEMORY_CORE_PORT=not-a-port\nMEMORY_CORE_GATEWAY_API_KEY=\n");
     assert.deepEqual(await runCli({ adapterRoot, deployDir }), {
       code: 1,
       stdout: "",
@@ -281,8 +331,9 @@ test("bootstrap CLI emits exact actionable sanitized results for success and fou
   }, async (port) => {
     await withSandbox(async ({ adapterRoot, deployDir }) => {
       const credential = "gateway-reject-test-placeholder";
-      await writeText(join(deployDir, ".admin-key"), credential);
-      await writeText(join(deployDir, ".env"), `MEMORY_CORE_PORT=${port}\n`);
+      const adminUserKey = "gateway-reject-admin-user-key";
+      await writeText(join(deployDir, ".admin-key"), adminUserKey);
+      await writeText(join(deployDir, ".env"), `MEMORY_CORE_PORT=${port}\nMEMORY_CORE_GATEWAY_API_KEY=${credential}\n`);
       const result = await runCli({ adapterRoot, deployDir });
       assert.deepEqual(result, {
         code: 1,
@@ -290,6 +341,7 @@ test("bootstrap CLI emits exact actionable sanitized results for success and fou
         stderr: "[FAIL] 配置未写入：MemoryCore/Gateway 不可用或拒绝固定身份。\n"
       });
       assert.equal(`${result.stdout}${result.stderr}`.includes(credential), false);
+      assert.equal(`${result.stdout}${result.stderr}`.includes(adminUserKey), false);
       assert.equal(`${result.stdout}${result.stderr}`.includes("sensitive response body"), false);
     });
   });

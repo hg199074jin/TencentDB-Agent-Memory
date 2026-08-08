@@ -36,13 +36,16 @@ ZCode Hook ───┘                              │
 2. Docker Desktop 已启动，`tdai-memory-core` 正常运行；如果要看管理页面，再启动 `tdai-memory-hub`。
 3. Node.js 版本不低于 22.16。运行 `node --version` 可以查看。
 
-本地部署凭据应位于：
+Gateway 地址和 Bearer 设置来自：
 
 ```text
-D:\TencentDB-Agent-Memory\deploy\global-images\.admin-key
+D:\TencentDB-Agent-Memory\deploy\global-images\.env
+MEMORY_CORE_GATEWAY_API_KEY=<Gateway Bearer>
 ```
 
-引导程序只读取这份现有凭据，不会在屏幕上显示它，也不会猜测或新造凭据。
+`MEMORY_CORE_GATEWAY_API_KEY` 非空时，它才是访问 Gateway 的 Bearer。默认本地部署会把它显式留空，表示关闭 Bearer gate；此时引导程序只会在 `config.local.json` 写入一个固定的非秘密兼容占位值，以满足本地适配器的配置格式，不会把占位值当作认证材料。
+
+同目录的 `.admin-key` 是 MemoryCore 管理员 `user_key`，用于 admin 初始化和用户认证，不是 Gateway Bearer，也不会被引导程序写入 `apiKey`。引导程序不会在屏幕上显示任何 key；如果 `.env` 没有明确声明 `MEMORY_CORE_GATEWAY_API_KEY`，它会停止并提示修正，不会猜测或新造凭据。
 
 ## 第一次安装
 
@@ -119,7 +122,8 @@ Memory Hub 启动后，在浏览器打开：
 
 ```text
 D:\TencentDB-Agent-Memory\integrations\cross-agent-memory\runtime\logs\status.jsonl
-D:\TencentDB-Agent-Memory\integrations\cross-agent-memory\runtime\pending-captures.jsonl
+D:\TencentDB-Agent-Memory\integrations\cross-agent-memory\runtime\capture-queue.jsonl
+D:\TencentDB-Agent-Memory\integrations\cross-agent-memory\runtime\capture-spool\
 D:\TencentDB-Agent-Memory\integrations\cross-agent-memory\runtime\backups\
 ```
 

@@ -14,6 +14,7 @@ import { GatewayClient } from "./gateway-client.mjs";
 
 const DEFAULT_ADAPTER_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_DEPLOY_DIR = resolve(DEFAULT_ADAPTER_ROOT, "..", "..", "deploy", "global-images");
+const BEARER_DISABLED_FALLBACK = "local-bearer-disabled-compatibility";
 
 export const FIXED_IDENTITY = Object.freeze({
   teamId: "team-personal-memory",
@@ -52,6 +53,39 @@ function parseLocalPort(source) {
     throw new BootstrapError("invalid-port", "Invalid local deployment MEMORY_CORE_PORT");
   }
   return port;
+}
+
+function parseGatewayCredential(source) {
+  let assignment;
+  for (const line of source.split(/\r?\n/)) {
+    const match = /^\s*(?:export\s+)?MEMORY_CORE_GATEWAY_API_KEY\s*=\s*(.*)$/.exec(line);
+    if (match) assignment = match[1].trim();
+  }
+  if (assignment === undefined) {
+    throw new BootstrapError(
+      "missing-gateway-key",
+      "MEMORY_CORE_GATEWAY_API_KEY must be explicitly set in deploy/global-images/.env"
+    );
+  }
+
+  let value;
+  if (assignment.startsWith("\"") || assignment.startsWith("'")) {
+    const quote = assignment[0];
+    const closing = assignment.indexOf(quote, 1);
+    if (closing < 0 || !/^\s*(?:#.*)?$/.test(assignment.slice(closing + 1))) {
+      throw new BootstrapError("invalid-gateway-key", "MEMORY_CORE_GATEWAY_API_KEY declaration is invalid");
+    }
+    value = assignment.slice(1, closing);
+  } else {
+    value = assignment.replace(/(?:^|\s+)#.*$/, "").trim();
+    if (/\s/.test(value)) {
+      throw new BootstrapError("invalid-gateway-key", "MEMORY_CORE_GATEWAY_API_KEY declaration is invalid");
+    }
+  }
+
+  return value === ""
+    ? { apiKey: BEARER_DISABLED_FALLBACK, credentialMode: "bearer-disabled-local-fallback" }
+    : { apiKey: value, credentialMode: "gateway-bearer" };
 }
 
 function makeConfig({ endpoint, apiKey }) {
@@ -124,17 +158,13 @@ export async function bootstrapConfig({
     );
   }
 
-  const keyPath = join(resolve(deployDir), ".admin-key");
-  const rawCredential = await readOptional(keyPath);
-  const apiKey = rawCredential?.toString("utf8").trim() ?? "";
-  if (!apiKey) {
-    throw new BootstrapError(
-      "missing-credential",
-      "Missing local deployment credential: deploy/global-images/.admin-key"
-    );
-  }
   const envSource = await readOptional(join(resolve(deployDir), ".env"));
-  const port = parseLocalPort(envSource?.toString("utf8") ?? null);
+  if (envSource === null) {
+    throw new BootstrapError("missing-env", "Missing local deployment config: deploy/global-images/.env");
+  }
+  const envText = envSource.toString("utf8");
+  const { apiKey, credentialMode } = parseGatewayCredential(envText);
+  const port = parseLocalPort(envText);
   const config = makeConfig({ endpoint: `http://127.0.0.1:${port}`, apiKey });
 
   await verifyFixedIdentity(config, gatewayFactory);
@@ -157,13 +187,17 @@ export async function bootstrapConfig({
     status: original === null ? "CREATED" : "REPLACED",
     configPath,
     backupPath,
-    identity: { ...FIXED_IDENTITY }
+    identity: { ...FIXED_IDENTITY },
+    credentialMode
   };
 }
 
 export function formatBootstrapResult(result) {
   const backup = result.backupPath ? "；原配置已备份到 D 盘 runtime" : "";
-  return `[${result.status}] 本机共享记忆配置已验证并写入，认证材料已配置但不会显示${backup}`;
+  const authentication = result.credentialMode === "bearer-disabled-local-fallback"
+    ? "Bearer gate 已显式关闭，已使用非秘密本地兼容占位值"
+    : "认证材料已配置但不会显示";
+  return `[${result.status}] 本机共享记忆配置已验证并写入，${authentication}${backup}`;
 }
 
 function parseArguments(argv) {
@@ -195,7 +229,9 @@ async function main() {
 function bootstrapFailureMessage(error) {
   const messages = {
     "existing-config": "[FAIL] 配置未写入：config.local.json 已存在；如需替换请使用 --force。",
-    "missing-credential": "[FAIL] 配置未写入：缺少本地部署凭据 .admin-key。",
+    "missing-env": "[FAIL] 配置未写入：缺少本地部署配置 deploy/global-images/.env。",
+    "missing-gateway-key": "[FAIL] 配置未写入：.env 必须显式设置 MEMORY_CORE_GATEWAY_API_KEY（非空 Bearer，或留空关闭 Bearer gate）。",
+    "invalid-gateway-key": "[FAIL] 配置未写入：MEMORY_CORE_GATEWAY_API_KEY 声明无效。",
     "invalid-port": "[FAIL] 配置未写入：本地 Gateway 端口配置无效。",
     gateway: "[FAIL] 配置未写入：MemoryCore/Gateway 不可用或拒绝固定身份。",
     "replace-failed": "[FAIL] 配置未写入：无法原子替换文件，原配置保持不变。",
