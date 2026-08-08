@@ -56,6 +56,31 @@ test("credential detection recognizes assigned English and Chinese secrets witho
   }
 });
 
+test("credential detection recognizes quoted JSON-style assignments but ignores empty values", () => {
+  for (const value of [
+    '{"password":"hunter2"}',
+    '{ "token" : "plain-secret-value" }',
+    '{"api_key":"api-secret-value"}',
+    '｛“密码”：“hunter2”｝',
+    '「token」＝「plain-secret-value」',
+    '＂password＂：＂hunter2＂'
+  ]) {
+    assert.equal(containsCredential(value), true, value);
+    assert.equal(inspectTurn("ordinary prompt", value).skip, true, value);
+  }
+
+  for (const value of [
+    '{"password":""}',
+    '{ "token" : "   " }',
+    '｛“密码”：“”｝',
+    "token budget",
+    "password policy",
+    "密码管理"
+  ]) {
+    assert.equal(containsCredential(value), false, value);
+  }
+});
+
 test("base64 media is removed without retaining the payload", () => {
   const result = inspectTurn("看图 data:image/png;base64," + "A".repeat(500), "完成");
   assert.equal(result.skip, false);

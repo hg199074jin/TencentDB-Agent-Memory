@@ -5,6 +5,7 @@ const LONG_BASE64_PATTERN = /[A-Za-z0-9+/=]{400,}/g;
 const CREDENTIAL_PATTERNS = [
   /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/i,
   /\bBearer\s+[A-Za-z0-9._~+/=-]+/i,
+  /(?:\b(?:api[_-]?key|access[_-]?token|secret[_-]?key|password|passwd|pwd|token)\b|密码)\s*["'＂”’」』]\s*[:=：＝]\s*["'＂“‘「『]?\s*[^\s,;，；:=：＝"'＂“”‘’「」『』{}\[\]]+/iu,
   /\b(?:api[_-]?key|access[_-]?token|secret[_-]?key)\s*[:=]\s*[^\s,;]+/i,
   /(?:\b(?:password|passwd|pwd|token)\b|密码)\s*[:=：＝]\s*[^\s,;，；:=：＝]+/iu,
   /\bsk-[A-Za-z0-9_-]+/i,
