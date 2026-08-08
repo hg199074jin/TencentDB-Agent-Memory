@@ -20,6 +20,8 @@ const ORPHAN_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const LOCK_STALE_MS = 30_000;
 const LOCK_ATTEMPTS = 60;
 const LOCK_RETRY_MS = 10;
+const PENDING_LOCK_WAIT_MS = LOCK_ATTEMPTS * LOCK_RETRY_MS;
+const PENDING_CLEANUP_BUDGET_MS = 100;
 
 function sha256(value) {
   return createHash("sha256").update(String(value), "utf8").digest("hex");
@@ -51,10 +53,11 @@ function pendingFileSystem(injectedFs = {}) {
   return { mkdir, readdir, rename, rm, stat, unlink, link, readFile, ...injectedFs };
 }
 
-async function acquirePendingLock(pendingDir, digest, injectedFs = {}) {
+async function acquirePendingLock(pendingDir, digest, injectedFs = {}, waitMs = PENDING_LOCK_WAIT_MS) {
   const fs = pendingFileSystem(injectedFs);
   const lockDir = join(pendingDir, `${digest}.pending-lock`);
-  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (let attempt = 0; attempt < LOCK_ATTEMPTS && Date.now() < deadline; attempt += 1) {
     try {
       await fs.mkdir(lockDir);
       return lockDir;
@@ -68,7 +71,7 @@ async function acquirePendingLock(pendingDir, digest, injectedFs = {}) {
       } catch {
         // The owner may have released the lock between checks.
       }
-      await sleep(LOCK_RETRY_MS);
+      await sleep(Math.min(LOCK_RETRY_MS, Math.max(0, deadline - Date.now())));
     }
   }
   return null;
@@ -135,8 +138,16 @@ async function cleanPendingDigest(pendingDir, digest, fs, threshold) {
     return;
   }
   try {
-    if ((await fs.stat(claim)).mtimeMs < threshold) await fs.unlink(claim);
-    else await restoreOrDiscardClaim(fs, claim, canonical);
+    const stale = (await fs.stat(claim)).mtimeMs < threshold;
+    if (stale) {
+      try {
+        await fs.unlink(claim);
+      } catch {
+        // Once confirmed stale, quarantine the claim; never reactivate its prompt.
+      }
+    } else {
+      await restoreOrDiscardClaim(fs, claim, canonical);
+    }
   } catch {
     await restoreOrDiscardClaim(fs, claim, canonical);
   }
@@ -153,6 +164,7 @@ async function cleanOrphanedPending(runtimeDir, injectedFs = {}) {
     return;
   }
   const threshold = Date.now() - ORPHAN_AGE_MS;
+  const deadline = Date.now() + PENDING_CLEANUP_BUDGET_MS;
   const digests = new Set();
   for (const entry of entries.filter((candidate) => candidate.isFile())) {
     const canonicalMatch = /^([a-f0-9]{64})\.json$/.exec(entry.name);
@@ -160,7 +172,9 @@ async function cleanOrphanedPending(runtimeDir, injectedFs = {}) {
     if (digest) digests.add(digest);
   }
   for (const digest of digests) {
-    const lockDir = await acquirePendingLock(pendingDir, digest, injectedFs);
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const lockDir = await acquirePendingLock(pendingDir, digest, injectedFs, remaining);
     if (!lockDir) continue;
     try {
       await cleanPendingDigest(pendingDir, digest, fs, threshold);

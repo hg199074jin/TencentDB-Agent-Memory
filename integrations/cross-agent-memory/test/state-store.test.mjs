@@ -272,6 +272,67 @@ test("cleanup discovers an unrestored take claim and expires it after seven days
   });
 });
 
+test("failed deletion quarantines an expired cleanup claim without restoring the stale canonical", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const key = { client: "codex", sourceSessionId: "stale-delete-failure" };
+    await savePendingTurn({ ...key, prompt: "stale prompt", skip: false, submittedAt: new Date().toISOString() }, { runtimeDir });
+    const pendingDir = join(runtimeDir, "pending");
+    const canonicalName = (await readdir(pendingDir)).find((name) => name.endsWith(".json"));
+    const digest = canonicalName.slice(0, -5);
+    const expired = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    await utimes(join(pendingDir, canonicalName), expired, expired);
+
+    await savePendingTurn({
+      client: "codex", sourceSessionId: "delete-failure-trigger", prompt: "trigger", skip: false, submittedAt: new Date().toISOString()
+    }, {
+      runtimeDir,
+      fs: {
+        unlink: async (path) => {
+          if (path.endsWith(".cleanup-claim")) throw new Error("injected unlink failure");
+          return rm(path);
+        }
+      }
+    });
+
+    let names = await readdir(pendingDir);
+    assert.equal(names.includes(`${digest}.json`), false);
+    assert.equal(names.some((name) => name.includes(digest) && name.endsWith(".cleanup-claim")), true);
+
+    await savePendingTurn({
+      client: "codex", sourceSessionId: "delete-retry-trigger", prompt: "trigger", skip: false, submittedAt: new Date().toISOString()
+    }, { runtimeDir });
+    names = await readdir(pendingDir);
+    assert.equal(names.includes(`${digest}.json`), false);
+    assert.equal(names.some((name) => name.includes(digest) && name.endsWith(".cleanup-claim")), false);
+  });
+});
+
+test("global cleanup has one aggregate budget across many locked sessions without losing their content", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const pendingDir = join(runtimeDir, "pending");
+    await mkdir(pendingDir, { recursive: true });
+    const locked = [];
+    for (let index = 0; index < 5; index += 1) {
+      const digest = createHash("sha256").update(`locked-${index}`, "utf8").digest("hex");
+      const source = JSON.stringify({ client: "codex", prompt: `raw prompt ${index}`, skip: false, submittedAt: new Date().toISOString() });
+      await writeFile(join(pendingDir, `${digest}.json`), source, "utf8");
+      await mkdir(join(pendingDir, `${digest}.pending-lock`));
+      locked.push({ digest, source });
+    }
+
+    const started = Date.now();
+    assert.equal(await savePendingTurn({
+      client: "codex", sourceSessionId: "budget-trigger", prompt: "trigger", skip: false, submittedAt: new Date().toISOString()
+    }, { runtimeDir }), true);
+    const elapsed = Date.now() - started;
+
+    assert.ok(elapsed < 500, `cleanup took ${elapsed}ms`);
+    for (const { digest, source } of locked) {
+      assert.equal(await readFile(join(pendingDir, `${digest}.json`), "utf8"), source);
+    }
+  });
+});
+
 test("enqueueCapture persists one JSON object per line without unrelated secrets", async () => {
   await withRuntime(async (runtimeDir) => {
     const queued = await enqueueCapture({
