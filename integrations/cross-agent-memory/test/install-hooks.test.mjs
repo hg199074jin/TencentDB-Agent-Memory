@@ -26,7 +26,7 @@ async function listOrEmpty(path) {
   }
 }
 
-async function withSandbox(run) {
+async function withSandbox(run, { remove = rm } = {}) {
   const root = await mkdtemp(join(tmpdir(), "cross-agent-hooks-"));
   const userProfile = join(root, "home");
   const runtimeDir = join(root, "runtime");
@@ -36,28 +36,51 @@ async function withSandbox(run) {
   const oldUserProfile = process.env.USERPROFILE;
   process.env.HOME = userProfile;
   process.env.USERPROFILE = userProfile;
+  let primaryError;
   try {
     await run({ root, userProfile, runtimeDir });
-  } finally {
+  } catch (error) {
+    primaryError = error;
+  }
+  const cleanupErrors = [];
+  try {
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  try {
     if (oldUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = oldUserProfile;
-    await rm(root, { recursive: true, force: true });
+  } catch (error) {
+    cleanupErrors.push(error);
   }
+  try {
+    await remove(root, { recursive: true, force: true });
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (primaryError && cleanupErrors.length > 0) {
+    throw new AggregateError([primaryError, ...cleanupErrors], "sandbox body and cleanup both failed");
+  }
+  if (primaryError) throw primaryError;
+  if (cleanupErrors.length === 1) throw cleanupErrors[0];
+  if (cleanupErrors.length > 1) throw new AggregateError(cleanupErrors, "sandbox cleanup failed");
 }
 
 function managedCount(config, event, client) {
   if (client === "zcode") {
-    return config.hooks.events[event].filter((entry) =>
-      entry.type === "process" && entry.args?.includes(ADAPTER_PATH)
-    ).length;
+    return config.hooks.events[event].reduce((count, group) => count +
+      (group.hooks ?? []).filter((entry) =>
+        entry.type === "process" && entry.command === "node" &&
+        entry.args?.[0] === ADAPTER_PATH && entry.args?.[1] === "zcode"
+      ).length, 0);
   }
   return config.hooks[event].filter((block) =>
     block.hooks?.some((entry) =>
-      `${entry.command ?? ""} ${entry.commandWindows ?? ""}`
-        .replaceAll("\\", "/")
-        .includes(ADAPTER_PATH.replaceAll("\\", "/"))
+      client === "codex"
+        ? entry.commandWindows === `node "${ADAPTER_PATH}" codex`
+        : entry.command === `node "${ADAPTER_PATH}" claude`
     )
   ).length;
 }
@@ -71,7 +94,11 @@ test("install uses current Codex hooks format and preserves all three rich confi
       description: "existing Codex hooks",
       customTopLevel: { keep: true },
       hooks: {
-        UserPromptSubmit: [{ hooks: [{ type: "command", command: "node existing-codex.mjs" }] }],
+        UserPromptSubmit: [{ hooks: [{
+          type: "command",
+          command: `node ${ADAPTER_PATH.replaceAll("\\", "/")}.old codex`,
+          commandWindows: `node "${ADAPTER_PATH}.old" codex`
+        }] }],
         Notification: [{ hooks: [{ type: "command", command: "notify-codex.exe" }] }]
       }
     };
@@ -84,7 +111,11 @@ test("install uses current Codex hooks format and preserves all three rich confi
       plugins: { "existing-plugin": true },
       permissions: { allow: ["Read"] },
       hooks: {
-        UserPromptSubmit: [{ hooks: [{ type: "command", command: "node existing-claude.mjs", timeout: 9 }] }],
+        UserPromptSubmit: [{ hooks: [{
+          type: "command",
+          command: `node "${ADAPTER_PATH}-backup" claude`,
+          timeout: 9
+        }] }],
         Notification: [{ hooks: [{ type: "command", command: "notify.exe" }] }]
       }
     };
@@ -96,8 +127,12 @@ test("install uses current Codex hooks format and preserves all three rich confi
       hooks: {
         enabled: false,
         events: {
-          UserPromptSubmit: [{ type: "process", command: "node", args: ["existing-zcode.mjs"] }],
-          AfterTool: [{ type: "process", command: "audit.exe", args: [] }]
+          UserPromptSubmit: [{ hooks: [{
+            type: "process",
+            command: "node",
+            args: [`${ADAPTER_PATH}.old`, "zcode"]
+          }] }],
+          AfterTool: [{ hooks: [{ type: "process", command: "audit.exe", args: [] }] }]
         }
       }
     };
@@ -155,13 +190,15 @@ test("install uses current Codex hooks format and preserves all three rich confi
     assert.equal(zcode.hooks.enabled, true);
     for (const event of ["UserPromptSubmit", "Stop"]) {
       assert.equal(managedCount(zcode, event, "zcode"), 1);
-      assert.deepEqual(zcode.hooks.events[event].at(-1), {
-        type: "process",
-        command: "node",
-        args: [ADAPTER_PATH, "zcode"],
-        enabled: true,
-        timeoutMs: 5000
-      });
+      const managed = zcode.hooks.events[event].at(-1);
+      assert.equal("matcher" in managed, false);
+      assert.deepEqual(managed.hooks, [{
+          type: "process",
+          command: "node",
+          args: [ADAPTER_PATH, "zcode"],
+          enabled: true,
+          timeoutMs: 5000
+        }]);
     }
 
     assert.deepEqual(result.changed.sort(), ["claude", "codex", "zcode"]);
@@ -212,12 +249,28 @@ test("uninstall removes only this exact adapter path and preserves later user ch
     const claude = await readJson(claudePath);
     const zcode = await readJson(zcodePath);
     codex.hooks.Stop[0].hooks.push({ type: "command", command: "node retained-same-block.mjs" });
+    zcode.hooks.events.Stop[0].hooks.push({
+      type: "process",
+      command: "node",
+      args: ["retained-same-group.mjs"]
+    });
     codex.description = "added after install";
-    codex.hooks.Stop.push({ hooks: [{ type: "command", command: "node D:/other/hook-cli.mjs codex" }] });
+    codex.hooks.Stop.push({ hooks: [{
+      type: "command",
+      command: `node ${ADAPTER_PATH.replaceAll("\\", "/")}.old codex`,
+      commandWindows: `node "${ADAPTER_PATH}.old" codex`
+    }] });
     claude.env = { MINIMAX_API_KEY: "still-present" };
-    claude.hooks.Stop.push({ hooks: [{ type: "command", command: "node D:/other/hook-cli.mjs claude" }] });
+    claude.hooks.Stop.push({ hooks: [{
+      type: "command",
+      command: `node "${ADAPTER_PATH}-backup" claude`
+    }] });
     zcode.plugins = ["added-after-install"];
-    zcode.hooks.events.Stop.push({ type: "process", command: "node", args: ["D:\\other\\hook-cli.mjs", "zcode"] });
+    zcode.hooks.events.Stop.push({ hooks: [{
+      type: "process",
+      command: "node",
+      args: [`${ADAPTER_PATH}.old`, "zcode"]
+    }] });
     await writeJson(codexPath, codex);
     await writeJson(claudePath, claude);
     await writeJson(zcodePath, zcode);
@@ -242,10 +295,12 @@ test("uninstall removes only this exact adapter path and preserves later user ch
       assert.equal(managedCount(after.claude, event, "claude"), 0);
       assert.equal(managedCount(after.zcode, event, "zcode"), 0);
     }
-    assert.equal(after.codex.hooks.Stop.at(-1).hooks[0].command, "node D:/other/hook-cli.mjs codex");
+    assert.equal(after.codex.hooks.Stop.at(-1).hooks[0].commandWindows, `node "${ADAPTER_PATH}.old" codex`);
     assert.equal(after.codex.hooks.Stop[0].hooks[0].command, "node retained-same-block.mjs");
-    assert.equal(after.claude.hooks.Stop.at(-1).hooks[0].command, "node D:/other/hook-cli.mjs claude");
-    assert.deepEqual(after.zcode.hooks.events.Stop.at(-1).args, ["D:\\other\\hook-cli.mjs", "zcode"]);
+    assert.equal(after.claude.hooks.Stop.at(-1).hooks[0].command, `node "${ADAPTER_PATH}-backup" claude`);
+    assert.deepEqual(after.zcode.hooks.events.Stop[0].hooks[0].args, ["retained-same-group.mjs"]);
+    assert.deepEqual(after.zcode.hooks.events.Stop.at(-1).hooks[0].args, [`${ADAPTER_PATH}.old`, "zcode"]);
+    assert.deepEqual(after.zcode.hooks.events.UserPromptSubmit, []);
     assert.equal(await readFile(join(result.backupDir, ".codex", "hooks.json"), "utf8"), beforeUninstall.codex);
     assert.equal(await readFile(join(result.backupDir, ".claude", "settings.json"), "utf8"), beforeUninstall.claude);
     assert.equal(await readFile(join(result.backupDir, ".zcode", "cli", "config.json"), "utf8"), beforeUninstall.zcode);
@@ -303,4 +358,30 @@ test("malformed existing JSON is rejected without backup or replacement", async 
     assert.equal(await readFile(zcodePath, "utf8"), malformed);
     await assert.rejects(readdir(join(runtimeDir, "backups")), { code: "ENOENT" });
   });
+});
+
+test("sandbox preserves the primary failure when cleanup also fails and restores both environment variables", async () => {
+  const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
+  const primary = new Error("primary assertion failed");
+  const cleanup = new Error("cleanup failed afterward");
+
+  await assert.rejects(
+    withSandbox(async () => {
+      throw primary;
+    }, {
+      remove: async (path, options) => {
+        await rm(path, options);
+        throw cleanup;
+      }
+    }),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors[0], primary);
+      assert.equal(error.errors[1], cleanup);
+      return true;
+    }
+  );
+  assert.equal(process.env.HOME, originalHome);
+  assert.equal(process.env.USERPROFILE, originalUserProfile);
 });

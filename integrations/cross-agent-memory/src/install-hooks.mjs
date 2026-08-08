@@ -40,12 +40,26 @@ function normalizedPath(value) {
   return String(value).replaceAll("\\", "/").toLowerCase();
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function commandReferencesAdapter(command, adapterPath) {
+  if (typeof command !== "string") return false;
+  const normalizedCommand = normalizedPath(command);
+  const needle = escapeRegExp(normalizedPath(adapterPath));
+  return new RegExp(`(^|[\\s"'])${needle}(?=$|[\\s"'])`).test(normalizedCommand);
+}
+
 function referencesAdapter(entry, adapterPath) {
   if (entry === null || typeof entry !== "object") return false;
-  const commandParts = [entry.command, entry.commandWindows];
-  if (Array.isArray(entry.args)) commandParts.push(...entry.args);
   const needle = normalizedPath(adapterPath);
-  return commandParts.some((part) => typeof part === "string" && normalizedPath(part).includes(needle));
+  const argumentMatch = Array.isArray(entry.args) && entry.args.some((argument) =>
+    typeof argument === "string" && normalizedPath(argument) === needle
+  );
+  return argumentMatch ||
+    commandReferencesAdapter(entry.command, adapterPath) ||
+    commandReferencesAdapter(entry.commandWindows, adapterPath);
 }
 
 function commandBlockReferencesAdapter(block, adapterPath) {
@@ -93,14 +107,16 @@ function addZcodeHooks(config, adapterPath) {
   hooks.enabled = true;
   const events = ensureObject(hooks, "events", "hooks.events");
   for (const event of EVENTS) {
-    const entries = ensureArray(events, event, `hooks.events.${event}`);
-    if (entries.some((entry) => referencesAdapter(entry, adapterPath))) continue;
-    entries.push({
-      type: "process",
-      command: "node",
-      args: [adapterPath, "zcode"],
-      enabled: true,
-      timeoutMs: 5000
+    const groups = ensureArray(events, event, `hooks.events.${event}`);
+    if (groups.some((group) => commandBlockReferencesAdapter(group, adapterPath))) continue;
+    groups.push({
+      hooks: [{
+        type: "process",
+        command: "node",
+        args: [adapterPath, "zcode"],
+        enabled: true,
+        timeoutMs: 5000
+      }]
     });
   }
 }
@@ -110,7 +126,12 @@ function removeZcodeHooks(config, adapterPath) {
   if (events === null || typeof events !== "object" || Array.isArray(events)) return;
   for (const event of EVENTS) {
     if (!Array.isArray(events[event])) continue;
-    events[event] = events[event].filter((entry) => !referencesAdapter(entry, adapterPath));
+    events[event] = events[event].flatMap((group) => {
+      if (!Array.isArray(group?.hooks)) return [group];
+      const remaining = group.hooks.filter((entry) => !referencesAdapter(entry, adapterPath));
+      if (remaining.length === group.hooks.length) return [group];
+      return remaining.length > 0 ? [{ ...group, hooks: remaining }] : [];
+    });
   }
 }
 
