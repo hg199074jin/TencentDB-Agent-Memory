@@ -277,11 +277,12 @@ test("shared hook CLI preserves the three-client process contract and fails open
     }
 
     const orderedSession = `ordered-${randomUUID()}`;
-    await runHook("codex", JSON.stringify({
+    const orderedSubmit = await runHook("codex", JSON.stringify({
       session_id: orderedSession,
       hook_event_name: "UserPromptSubmit",
       prompt: "current ordered prompt"
     }));
+    stderrOutputs.push(orderedSubmit.stderr);
     await enqueueCapture({
       memorySessionId: "codex-seeded-old-record",
       messages: [
@@ -295,6 +296,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
       hook_event_name: "Stop",
       last_assistant_message: "current ordered answer"
     }));
+    stderrOutputs.push(orderedStop.stderr);
     assert.deepEqual(orderedStop.output, {});
     assert.equal(orderedStop.stdout, "{}\n");
     assert.deepEqual(gateway.requests.map((item) => item.path), [
@@ -307,7 +309,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
     assert.equal(gateway.requests[2].body.messages[0].content, "old queued prompt");
 
     const captureFailureSession = `capture-failure-${randomUUID()}`;
-    await runHook("codex", JSON.stringify({
+    const captureFailureSubmit = await runHook("codex", JSON.stringify({
       session_id: captureFailureSession,
       hook_event_name: "UserPromptSubmit",
       prompt: "capture failure current prompt"
@@ -317,6 +319,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
       hook_event_name: "Stop",
       last_assistant_message: "capture failure current answer"
     }));
+    stderrOutputs.push(captureFailureSubmit.stderr, captureFailure.stderr);
     assert.equal(captureFailure.stdout, "{}\n");
     assert.deepEqual((await queuedRecords()).at(-1).messages.map(({ role, content }) => ({ role, content })), [
       { role: "user", content: "capture failure current prompt" },
@@ -325,7 +328,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
     await clearQueue();
 
     const retryHangSession = `retry-hang-${randomUUID()}`;
-    await runHook("codex", JSON.stringify({
+    const retryHangSubmit = await runHook("codex", JSON.stringify({
       session_id: retryHangSession,
       hook_event_name: "UserPromptSubmit",
       prompt: "retry hang current prompt"
@@ -343,6 +346,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
       hook_event_name: "Stop",
       last_assistant_message: "retry hang current answer"
     }));
+    stderrOutputs.push(retryHangSubmit.stderr, retryHang.stderr);
     const retryElapsed = Date.now() - retryStarted;
     assert.equal(retryHang.stdout, "{}\n");
     assert.ok(retryElapsed >= 650 && retryElapsed < 2_000, `retry took ${retryElapsed}ms`);
@@ -389,7 +393,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
     ]) {
       await writeConfig();
       const sessionId = `${configCase}-${randomUUID()}`;
-      await runHook("claude", JSON.stringify({
+      const configSubmit = await runHook("claude", JSON.stringify({
         session_id: sessionId,
         hook_event_name: "UserPromptSubmit",
         prompt: `${configCase} current prompt`
@@ -401,6 +405,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
         hook_event_name: "Stop",
         last_assistant_message: `${configCase} current answer`
       }));
+      stderrOutputs.push(configSubmit.stderr, stopped.stderr);
       assert.equal(stopped.stdout, "{}\n");
       const queued = (await queuedRecords()).at(-1);
       assert.deepEqual(queued.messages.map(({ role, content }) => ({ role, content })), [
@@ -412,7 +417,26 @@ test("shared hook CLI preserves the three-client process contract and fails open
 
     const logSource = await readFile(join(runtimeDir, "logs", "status.jsonl"), "utf8");
     const diagnostics = `${stderrOutputs.join("")}\n${logSource}`;
-    for (const secret of [privatePrompt, privateAssistant, apiKey, "NEVER-READ-TRANSCRIPT-9912"]) {
+    for (const secret of [
+      privatePrompt,
+      privateAssistant,
+      apiKey,
+      "NEVER-READ-TRANSCRIPT-9912",
+      "current ordered prompt",
+      "current ordered answer",
+      "old queued prompt",
+      "old queued answer",
+      "capture failure current prompt",
+      "capture failure current answer",
+      "retry hang current prompt",
+      "retry hang current answer",
+      "hanging old prompt",
+      "hanging old answer",
+      "missing-stop-config current prompt",
+      "missing-stop-config current answer",
+      "invalid-stop-config current prompt",
+      "invalid-stop-config current answer"
+    ]) {
       assert.equal(diagnostics.includes(secret), false);
     }
     for (const line of logSource.trim().split("\n")) {
