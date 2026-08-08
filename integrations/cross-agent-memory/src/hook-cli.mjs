@@ -57,7 +57,8 @@ async function readInputLine() {
 }
 
 function sourceSessionId(input) {
-  return typeof input?.session_id === "string" ? input.session_id : "";
+  const sessionId = typeof input?.session_id === "string" ? input.session_id : "";
+  return sessionId.trim() === "" ? "" : sessionId;
 }
 
 function configWithinDeadline(config, deadline) {
@@ -161,6 +162,7 @@ async function handle(client, input, deadline) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     return { output: {}, status: "invalid-input" };
   }
+  if (sourceSessionId(input) === "") return { output: {}, status: "invalid-session" };
   if (input.hook_event_name === "UserPromptSubmit") return userPromptSubmit(client, input, deadline);
   if (input.hook_event_name === "Stop") return stop(client, input, deadline);
   return { output: {}, status: "unknown-event" };

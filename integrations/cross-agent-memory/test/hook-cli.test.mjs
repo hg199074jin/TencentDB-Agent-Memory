@@ -14,7 +14,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { enqueueCapture } from "../src/state-store.mjs";
+import { enqueueCapture, savePendingTurn, takePendingTurn } from "../src/state-store.mjs";
 
 const adapterDir = fileURLToPath(new URL("../", import.meta.url));
 const hookCli = join(adapterDir, "src", "hook-cli.mjs");
@@ -165,13 +165,59 @@ async function pendingRecord(client, sourceSessionId) {
 }
 
 async function runtimeText(path = runtimeDir) {
+  let entries;
+  try {
+    entries = await readdir(path, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return "";
+    throw error;
+  }
+  if (path === runtimeDir) entries = entries.filter((entry) => isSharedRuntimeEntry(entry.name));
   let output = "";
-  for (const entry of await readdir(path, { withFileTypes: true })) {
+  for (const entry of entries) {
     const child = join(path, entry.name);
-    if (entry.isDirectory()) output += await runtimeText(child);
-    else output += await readFile(child, "utf8");
+    try {
+      if (entry.isDirectory()) output += await runtimeText(child);
+      else output += await readFile(child, "utf8");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
   }
   return output;
+}
+
+async function directorySnapshot(path) {
+  const records = [];
+  let entries;
+  try {
+    entries = await readdir(path, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return records;
+    throw error;
+  }
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const child = join(path, entry.name);
+    if (entry.isDirectory()) {
+      records.push([entry.name, await directorySnapshot(child)]);
+    } else {
+      records.push([entry.name, await readFile(child, "utf8")]);
+    }
+  }
+  return records;
+}
+
+async function persistedTurnState() {
+  let queue = null;
+  try {
+    queue = await readFile(join(runtimeDir, "capture-queue.jsonl"), "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return JSON.stringify({
+    pending: await directorySnapshot(join(runtimeDir, "pending")),
+    spool: await directorySnapshot(join(runtimeDir, "capture-spool")),
+    queue
+  });
 }
 
 function primaryFirst(primaryError, cleanupErrors, message) {
@@ -281,6 +327,83 @@ test("shared hook CLI preserves the three-client process contract and fails open
     }), "utf8");
 
     await writeConfig();
+    const invalidSessions = [
+      ["missing", {}],
+      ["non-string", { session_id: 17 }],
+      ["empty", { session_id: "" }],
+      ["whitespace", { session_id: " \t " }]
+    ];
+    for (const client of ["codex", "claude", "zcode"]) {
+      const seededEmptyPrompt = `SEEDED-EMPTY-SESSION-${client}-6632`;
+      assert.equal(await savePendingTurn({
+        client,
+        sourceSessionId: "",
+        prompt: seededEmptyPrompt,
+        skip: false,
+        submittedAt: "2026-08-08T00:00:00.000Z"
+      }, { runtimeDir }), true);
+      const beforeRequests = gateway.requests.length;
+      const beforeState = await persistedTurnState();
+      const malformedSecrets = [];
+      for (const [label, session] of invalidSessions) {
+        const secret = `MALFORMED-${client}-${label}-PROMPT-8197`;
+        malformedSecrets.push(secret);
+        const result = await runHook(client, JSON.stringify({
+          ...session,
+          hook_event_name: "UserPromptSubmit",
+          prompt: secret
+        }));
+        stderrOutputs.push(result.stderr);
+        assert.deepEqual(result.output, {});
+        assert.equal(result.stdout, "{}\n");
+      }
+      for (const [label, session] of invalidSessions) {
+        const secret = `MALFORMED-${client}-${label}-ANSWER-2746`;
+        malformedSecrets.push(secret);
+        const result = await runHook(client, JSON.stringify({
+          ...session,
+          hook_event_name: "Stop",
+          stop_hook_active: false,
+          last_assistant_message: secret
+        }));
+        stderrOutputs.push(result.stderr);
+        assert.deepEqual(result.output, {});
+        assert.equal(result.stdout, "{}\n");
+      }
+      assert.equal(gateway.requests.length, beforeRequests);
+      assert.equal(await persistedTurnState(), beforeState);
+      assert.equal((await takePendingTurn({
+        client,
+        sourceSessionId: ""
+      }, { runtimeDir })).prompt, seededEmptyPrompt);
+      const persistedRuntime = await runtimeText();
+      for (const secret of malformedSecrets) {
+        assert.equal(persistedRuntime.includes(secret), false);
+      }
+    }
+
+    for (const client of ["codex", "claude", "zcode"]) {
+      const paddedSessionId = `  padded-${client}-${randomUUID()}  `;
+      const beforeRequests = gateway.requests.length;
+      await runHook(client, JSON.stringify({
+        session_id: paddedSessionId,
+        hook_event_name: "UserPromptSubmit",
+        prompt: `padded valid ${client} prompt`
+      }));
+      await runHook(client, JSON.stringify({
+        session_id: paddedSessionId,
+        hook_event_name: "Stop",
+        last_assistant_message: `padded valid ${client} answer`
+      }));
+      const expectedMemorySession = `${client}-${createHash("sha256")
+        .update(paddedSessionId, "utf8")
+        .digest("hex")
+        .slice(0, 24)}`;
+      const newRequests = gateway.requests.slice(beforeRequests);
+      assert.equal(newRequests.some((item) =>
+        item.path === "/v3/conversation/add" && item.body.session_id === expectedMemorySession), true);
+    }
+
     for (const client of ["codex", "claude", "zcode"]) {
       const sessionId = `${client}-${randomUUID()}`;
       const recalled = await runHook(client, JSON.stringify({
@@ -327,9 +450,12 @@ test("shared hook CLI preserves the three-client process contract and fails open
       assert.equal(gateway.requests.length, before);
     }
 
-    for (const [label, privateSkippedPrompt] of [
-      ["directive", "/nomemory OPT-OUT-SENTINEL-4091"],
-      ["credential", "api_key=CREDENTIAL-SENTINEL-7812"]
+    for (const [label, privateSkippedPrompt, sentinel] of [
+      ["directive", "/nomemory OPT-OUT-SENTINEL-4091", "OPT-OUT-SENTINEL-4091"],
+      ["credential", "api_key=CREDENTIAL-SENTINEL-7812", "CREDENTIAL-SENTINEL-7812"],
+      ["json-password", '{"password":"JSON-PASSWORD-SENTINEL-6314"}', "JSON-PASSWORD-SENTINEL-6314"],
+      ["json-token", '{"token":"JSON-TOKEN-SENTINEL-5228"}', "JSON-TOKEN-SENTINEL-5228"],
+      ["json-api-key", '{"api_key":"JSON-API-KEY-SENTINEL-9406"}', "JSON-API-KEY-SENTINEL-9406"]
     ]) {
       const sessionId = `${label}-${randomUUID()}`;
       await runHook("codex", JSON.stringify({
@@ -372,6 +498,7 @@ test("shared hook CLI preserves the three-client process contract and fails open
       assert.equal(gateway.requests.length, before);
       const persistedRuntime = await runtimeText();
       assert.equal(persistedRuntime.includes(privateSkippedPrompt), false);
+      assert.equal(persistedRuntime.includes(sentinel), false);
       await clearQueue();
     }
 
