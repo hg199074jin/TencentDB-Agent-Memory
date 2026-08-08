@@ -201,6 +201,8 @@ node src/doctor.mjs
 
 这套回归把半年内最容易变化的地方集中在 MemoryCore API、Hook 输入输出和三端配置格式。测试和诊断通过后，才重新安装或继续真实验收。
 
+自动化测试为了避免接触真实配置，只在同时设置 `CROSS_AGENT_MEMORY_TEST_MODE=1` 时读取 `CROSS_AGENT_MEMORY_TEST_ADAPTER_ROOT` 和 `CROSS_AGENT_MEMORY_TEST_DEPLOY_DIR` 两个临时路径变量。它们只用于测试隔离、不承载凭据，日常使用不要设置。
+
 ## 本机验证记录
 
 此处只记录日期、客户端版本、容器状态、自动测试数量和五项验收结论。不要记录偏好原文、事实原文或任何 key。首次真实验收完成后再填写。

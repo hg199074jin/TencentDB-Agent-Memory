@@ -4,7 +4,11 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-import { formatDoctorReport, runDoctor } from "../src/doctor.mjs";
+import {
+  formatDoctorReport,
+  isClientHookConfigRegistered,
+  runDoctor
+} from "../src/doctor.mjs";
 
 const ADAPTER_PATH = resolve("integrations/cross-agent-memory/src/hook-cli.mjs");
 
@@ -13,8 +17,9 @@ async function writeJson(path, value) {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
-async function withSandbox(run) {
+async function withSandbox(run, { remove = rm } = {}) {
   const root = await mkdtemp(join(tmpdir(), "cross-agent-doctor-"));
+  let primaryError;
   try {
     const adapterRoot = join(root, "adapter");
     const userProfile = join(root, "profile");
@@ -30,16 +35,29 @@ async function withSandbox(run) {
       }
     });
     await run({ root, adapterRoot, userProfile });
-  } finally {
-    await rm(root, { recursive: true, force: true });
+  } catch (error) {
+    primaryError = error;
   }
+  let cleanupError;
+  try {
+    await remove(root, { recursive: true, force: true });
+  } catch (error) {
+    cleanupError = error;
+  }
+  if (primaryError && cleanupError) throw new AggregateError([primaryError, cleanupError]);
+  if (primaryError) throw primaryError;
+  if (cleanupError) throw cleanupError;
 }
 
 async function registerAllHooks(userProfile) {
-  const commandGroup = (client) => ({ hooks: [{
+  const commandGroup = (client) => ({ hooks: [client === "codex" ? {
     type: "command",
-    command: `node \"${ADAPTER_PATH}\" ${client}`,
-    commandWindows: client === "codex" ? `node \"${ADAPTER_PATH}\" codex` : undefined,
+    command: `node ${ADAPTER_PATH.replaceAll("\\", "/")} codex`,
+    commandWindows: `node \"${ADAPTER_PATH}\" codex`,
+    timeout: 5
+  } : {
+    type: "command",
+    command: `node \"${ADAPTER_PATH}\" claude`,
     timeout: 5
   }] });
   await writeJson(join(userProfile, ".codex", "hooks.json"), {
@@ -63,6 +81,35 @@ async function registerAllHooks(userProfile) {
       events: { UserPromptSubmit: [zcodeGroup], Stop: [zcodeGroup] }
     }
   });
+}
+
+function configFor(client, entry, enabled = true) {
+  const group = { hooks: [entry] };
+  if (client === "zcode") {
+    return { hooks: { enabled, events: { UserPromptSubmit: [group], Stop: [group] } } };
+  }
+  return { hooks: { UserPromptSubmit: [group], Stop: [group] } };
+}
+
+function validEntry(client) {
+  if (client === "codex") {
+    return {
+      type: "command",
+      command: `node ${ADAPTER_PATH.replaceAll("\\", "/")} codex`,
+      commandWindows: `node \"${ADAPTER_PATH}\" codex`,
+      timeout: 5
+    };
+  }
+  if (client === "claude") {
+    return { type: "command", command: `node \"${ADAPTER_PATH}\" claude`, timeout: 5 };
+  }
+  return {
+    type: "process",
+    command: "node",
+    args: [ADAPTER_PATH, "zcode"],
+    enabled: true,
+    timeoutMs: 5000
+  };
 }
 
 function makeGateway(overrides = {}) {
@@ -137,6 +184,55 @@ test("doctor reports sanitized failures and detects incomplete matcher groups", 
   });
 });
 
+test("doctor accepts only the complete current handler shape for every client", () => {
+  for (const client of ["codex", "claude", "zcode"]) {
+    assert.equal(
+      isClientHookConfigRegistered(configFor(client, validEntry(client)), client, ADAPTER_PATH),
+      true,
+      `${client} valid handler`
+    );
+  }
+
+  const codexInvalid = [
+    { ...validEntry("codex"), type: "process" },
+    { ...validEntry("codex"), command: `node ${ADAPTER_PATH.replaceAll("\\", "/")}.old codex` },
+    { ...validEntry("codex"), commandWindows: `node \"${ADAPTER_PATH}-backup\" codex` },
+    { ...validEntry("codex"), command: `node ${ADAPTER_PATH.replaceAll("\\", "/")} claude`, commandWindows: `node \"${ADAPTER_PATH}\" claude` },
+    { ...validEntry("codex"), command: `bun ${ADAPTER_PATH.replaceAll("\\", "/")} codex` },
+    { ...validEntry("codex"), timeout: 0 }
+  ];
+  const claudeInvalid = [
+    { ...validEntry("claude"), type: "process" },
+    { ...validEntry("claude"), command: `node \"${ADAPTER_PATH}.old\" claude` },
+    { ...validEntry("claude"), command: `node \"${ADAPTER_PATH}\" codex` },
+    { ...validEntry("claude"), command: `bun \"${ADAPTER_PATH}\" claude` },
+    { ...validEntry("claude"), timeout: 0 }
+  ];
+  const zcodeInvalid = [
+    { ...validEntry("zcode"), type: "command" },
+    { ...validEntry("zcode"), command: "node.exe" },
+    { ...validEntry("zcode"), args: [`${ADAPTER_PATH}.old`, "zcode"] },
+    { ...validEntry("zcode"), args: [ADAPTER_PATH, "claude"] },
+    { ...validEntry("zcode"), args: [ADAPTER_PATH, "zcode", "extra"] },
+    { ...validEntry("zcode"), enabled: false },
+    { ...validEntry("zcode"), timeoutMs: 0 }
+  ];
+
+  for (const entry of codexInvalid) {
+    assert.equal(isClientHookConfigRegistered(configFor("codex", entry), "codex", ADAPTER_PATH), false);
+  }
+  for (const entry of claudeInvalid) {
+    assert.equal(isClientHookConfigRegistered(configFor("claude", entry), "claude", ADAPTER_PATH), false);
+  }
+  for (const entry of zcodeInvalid) {
+    assert.equal(isClientHookConfigRegistered(configFor("zcode", entry), "zcode", ADAPTER_PATH), false);
+  }
+  assert.equal(
+    isClientHookConfigRegistered(configFor("zcode", validEntry("zcode"), false), "zcode", ADAPTER_PATH),
+    false
+  );
+});
+
 test("doctor performs the optional write only when explicitly enabled", async () => {
   await withSandbox(async ({ adapterRoot, userProfile }) => {
     await registerAllHooks(userProfile);
@@ -177,4 +273,13 @@ test("doctor marks dependent checks failed when config is missing without leakin
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("doctor sandbox preserves both a primary failure and a cleanup failure", async () => {
+  const primary = new Error("primary test failure");
+  const cleanup = new Error("cleanup test failure");
+  await assert.rejects(
+    withSandbox(async () => { throw primary; }, { remove: async () => { throw cleanup; } }),
+    (error) => error instanceof AggregateError && error.errors[0] === primary && error.errors[1] === cleanup
+  );
 });

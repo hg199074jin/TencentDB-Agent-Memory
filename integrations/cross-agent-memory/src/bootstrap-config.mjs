@@ -22,16 +22,24 @@ export const FIXED_IDENTITY = Object.freeze({
   taskId: "task-cross-agent-chat"
 });
 
+class BootstrapError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "BootstrapError";
+    this.code = code;
+  }
+}
+
 function timestampName(now) {
   return now().toISOString().replaceAll(":", "-");
 }
 
 async function readOptional(path) {
   try {
-    return await readFile(path, "utf8");
+    return await readFile(path);
   } catch (error) {
     if (error?.code === "ENOENT") return null;
-    throw new Error("Unable to read local setup files");
+    throw new BootstrapError("local-files", "Unable to read local setup files");
   }
 }
 
@@ -41,7 +49,7 @@ function parseLocalPort(source) {
   if (!match) return 8420;
   const port = Number(match[1].replace(/^['"]|['"]$/g, ""));
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error("Invalid local deployment MEMORY_CORE_PORT");
+    throw new BootstrapError("invalid-port", "Invalid local deployment MEMORY_CORE_PORT");
   }
   return port;
 }
@@ -63,20 +71,25 @@ async function verifyFixedIdentity(config, gatewayFactory) {
     const gateway = gatewayFactory(config);
     await gateway.readCore();
   } catch {
-    throw new Error(
+    throw new BootstrapError(
+      "gateway",
       "Fixed identity was rejected or the Gateway is unavailable; config was not written. " +
       "Start MemoryCore and confirm the current standalone Gateway accepts the fixed identity."
     );
   }
 }
 
-async function atomicWrite(path, source) {
+async function atomicWrite(path, source, renameFile) {
   await mkdir(dirname(path), { recursive: true });
   const temporaryPath = `${path}.bootstrap-${process.pid}-${randomUUID()}.tmp`;
   try {
     await writeFile(temporaryPath, source, { encoding: "utf8", flag: "wx" });
     JSON.parse(await readFile(temporaryPath, "utf8"));
-    await rename(temporaryPath, path);
+    try {
+      await renameFile(temporaryPath, path);
+    } catch {
+      throw new BootstrapError("replace-failed", "Unable to replace local config; original remains unchanged");
+    }
   } finally {
     await unlink(temporaryPath).catch((error) => {
       if (error?.code !== "ENOENT") throw error;
@@ -89,25 +102,39 @@ export async function bootstrapConfig({
   deployDir = DEFAULT_DEPLOY_DIR,
   force = false,
   now = () => new Date(),
-  gatewayFactory = (config) => new GatewayClient(config)
+  gatewayFactory = (config) => new GatewayClient(config),
+  renameFile = rename
 } = {}) {
   const root = resolve(adapterRoot);
   const configPath = join(root, "config.local.json");
   const original = await readOptional(configPath);
 
   if (original !== null && !force) {
-    await loadConfig(root);
-    throw new Error("config.local.json already exists; use --force to replace it after backup");
+    try {
+      await loadConfig(root);
+    } catch {
+      throw new BootstrapError(
+        "existing-config",
+        "config.local.json already exists but is invalid; use --force to replace it after backup"
+      );
+    }
+    throw new BootstrapError(
+      "existing-config",
+      "config.local.json already exists; use --force to replace it after backup"
+    );
   }
 
   const keyPath = join(resolve(deployDir), ".admin-key");
   const rawCredential = await readOptional(keyPath);
-  const apiKey = rawCredential?.trim() ?? "";
+  const apiKey = rawCredential?.toString("utf8").trim() ?? "";
   if (!apiKey) {
-    throw new Error("Missing local deployment credential: deploy/global-images/.admin-key");
+    throw new BootstrapError(
+      "missing-credential",
+      "Missing local deployment credential: deploy/global-images/.admin-key"
+    );
   }
   const envSource = await readOptional(join(resolve(deployDir), ".env"));
-  const port = parseLocalPort(envSource);
+  const port = parseLocalPort(envSource?.toString("utf8") ?? null);
   const config = makeConfig({ endpoint: `http://127.0.0.1:${port}`, apiKey });
 
   await verifyFixedIdentity(config, gatewayFactory);
@@ -122,10 +149,10 @@ export async function bootstrapConfig({
       "config.local.json"
     );
     await mkdir(dirname(backupPath), { recursive: true });
-    await writeFile(backupPath, original, { encoding: "utf8", flag: "wx" });
+    await writeFile(backupPath, original, { flag: "wx" });
   }
 
-  await atomicWrite(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  await atomicWrite(configPath, `${JSON.stringify(config, null, 2)}\n`, renameFile);
   return {
     status: original === null ? "CREATED" : "REPLACED",
     configPath,
@@ -149,14 +176,38 @@ function parseArguments(argv) {
 }
 
 async function main() {
-  const result = await bootstrapConfig(parseArguments(process.argv.slice(2)));
+  const parsed = parseArguments(process.argv.slice(2));
+  // These path overrides are intentionally test-only. They carry no credentials
+  // and are ignored unless the explicit test-mode guard is present.
+  const testPaths = process.env.CROSS_AGENT_MEMORY_TEST_MODE === "1"
+    ? {
+        adapterRoot: process.env.CROSS_AGENT_MEMORY_TEST_ADAPTER_ROOT,
+        deployDir: process.env.CROSS_AGENT_MEMORY_TEST_DEPLOY_DIR
+      }
+    : {};
+  const result = await bootstrapConfig({
+    ...parsed,
+    ...Object.fromEntries(Object.entries(testPaths).filter(([, value]) => value))
+  });
   process.stdout.write(`${formatBootstrapResult(result)}\n`);
+}
+
+function bootstrapFailureMessage(error) {
+  const messages = {
+    "existing-config": "[FAIL] 配置未写入：config.local.json 已存在；如需替换请使用 --force。",
+    "missing-credential": "[FAIL] 配置未写入：缺少本地部署凭据 .admin-key。",
+    "invalid-port": "[FAIL] 配置未写入：本地 Gateway 端口配置无效。",
+    gateway: "[FAIL] 配置未写入：MemoryCore/Gateway 不可用或拒绝固定身份。",
+    "replace-failed": "[FAIL] 配置未写入：无法原子替换文件，原配置保持不变。",
+    "local-files": "[FAIL] 配置未写入：本地配置文件不可读取。"
+  };
+  return messages[error?.code] ?? "[FAIL] 配置未写入：发生本地设置错误，未显示配置内容。";
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : null;
 if (invokedPath === fileURLToPath(import.meta.url)) {
-  main().catch(() => {
-    process.stderr.write("[FAIL] 配置未写入：请确认 MemoryCore/Gateway 已启动且本地部署凭据存在。\n");
+  main().catch((error) => {
+    process.stderr.write(`${bootstrapFailureMessage(error)}\n`);
     process.exitCode = 1;
   });
 }

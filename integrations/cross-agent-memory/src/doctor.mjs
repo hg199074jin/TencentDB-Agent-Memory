@@ -37,19 +37,48 @@ function normalizedPath(value) {
   return String(value).replaceAll("\\", "/").toLowerCase();
 }
 
-function entryReferencesAdapter(entry, adapterPath, client) {
+function normalizedCommand(value) {
+  return normalizedPath(value).trim();
+}
+
+function validHandler(entry, adapterPath, client) {
   if (entry === null || typeof entry !== "object") return false;
-  const path = normalizedPath(adapterPath);
-  const command = `${entry.command ?? ""} ${entry.commandWindows ?? ""}`.toLowerCase().replaceAll("\\", "/");
-  const commandMatch = command.includes(path) && command.includes(client);
-  const argsMatch = Array.isArray(entry.args) &&
-    normalizedPath(entry.args[0] ?? "") === path && entry.args[1] === client;
-  return commandMatch || argsMatch;
+  const path = resolve(adapterPath);
+  if (client === "zcode") {
+    return entry.type === "process" &&
+      entry.command === "node" &&
+      Array.isArray(entry.args) &&
+      entry.args.length === 2 &&
+      normalizedPath(entry.args[0]) === normalizedPath(path) &&
+      entry.args[1] === "zcode" &&
+      entry.enabled === true &&
+      entry.timeoutMs === 5000;
+  }
+  if (entry.type !== "command" || entry.timeout !== 5) return false;
+  if (client === "codex") {
+    return normalizedCommand(entry.command) === normalizedCommand(`node ${path.replaceAll("\\", "/")} codex`) &&
+      normalizedCommand(entry.commandWindows) === normalizedCommand(`node "${path}" codex`);
+  }
+  return normalizedCommand(entry.command) === normalizedCommand(`node "${path}" claude`);
 }
 
 function groupRegistered(group, adapterPath, client) {
-  return Array.isArray(group?.hooks) &&
-    group.hooks.some((entry) => entryReferencesAdapter(entry, adapterPath, client));
+  return Array.isArray(group?.hooks) && group.hooks.some((entry) => validHandler(entry, adapterPath, client));
+}
+
+export function isClientHookConfigRegistered(config, client, adapterPath = DEFAULT_ADAPTER_PATH) {
+  if (!(["codex", "claude", "zcode"].includes(client))) return false;
+  if (client === "zcode") {
+    if (config?.hooks?.enabled !== true) return false;
+    return EVENTS.every((event) =>
+      Array.isArray(config?.hooks?.events?.[event]) &&
+      config.hooks.events[event].some((group) => groupRegistered(group, adapterPath, client))
+    );
+  }
+  return EVENTS.every((event) =>
+    Array.isArray(config?.hooks?.[event]) &&
+    config.hooks[event].some((group) => groupRegistered(group, adapterPath, client))
+  );
 }
 
 async function readJson(path) {
@@ -66,17 +95,7 @@ async function hookRegistered({ client, userProfile, adapterPath }) {
       ? join(userProfile, ".claude", "settings.json")
       : join(userProfile, ".zcode", "cli", "config.json");
   const config = await readJson(configPath);
-  if (client === "zcode") {
-    if (config?.hooks?.enabled !== true) return false;
-    return EVENTS.every((event) =>
-      Array.isArray(config?.hooks?.events?.[event]) &&
-      config.hooks.events[event].some((group) => groupRegistered(group, adapterPath, client))
-    );
-  }
-  return EVENTS.every((event) =>
-    Array.isArray(config?.hooks?.[event]) &&
-    config.hooks[event].some((group) => groupRegistered(group, adapterPath, client))
-  );
+  return isClientHookConfigRegistered(config, client, adapterPath);
 }
 
 async function defaultHealthCheck(config) {
