@@ -47,8 +47,103 @@ async function removeIfExists(path) {
   }
 }
 
+function pendingFileSystem(injectedFs = {}) {
+  return { mkdir, readdir, rename, rm, stat, unlink, link, readFile, ...injectedFs };
+}
+
+async function acquirePendingLock(pendingDir, digest, injectedFs = {}) {
+  const fs = pendingFileSystem(injectedFs);
+  const lockDir = join(pendingDir, `${digest}.pending-lock`);
+  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
+    try {
+      await fs.mkdir(lockDir);
+      return lockDir;
+    } catch (error) {
+      if (error?.code !== "EEXIST") return null;
+      try {
+        if (Date.now() - (await fs.stat(lockDir)).mtimeMs > LOCK_STALE_MS) {
+          await fs.rm(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // The owner may have released the lock between checks.
+      }
+      await sleep(LOCK_RETRY_MS);
+    }
+  }
+  return null;
+}
+
+async function releasePendingLock(lockDir, injectedFs = {}) {
+  if (!lockDir) return;
+  try {
+    await pendingFileSystem(injectedFs).rm(lockDir, { recursive: true, force: true });
+  } catch {
+    // A later Hook can reclaim a stale lock.
+  }
+}
+
+function claimDigest(name) {
+  return /^\.?([a-f0-9]{64})(?:\.json)?\.\d+\.[0-9a-f-]+\.(?:take|cleanup)-claim$/.exec(name)?.[1];
+}
+
+async function restoreOrDiscardClaim(fs, claim, canonical) {
+  try {
+    await fs.link(claim, canonical);
+  } catch (error) {
+    if (error?.code !== "EEXIST") return false;
+  }
+  try {
+    await fs.unlink(claim);
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+async function recoverClaimsForDigest(pendingDir, digest, fs, threshold) {
+  let entries;
+  try {
+    entries = await fs.readdir(pendingDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const canonical = join(pendingDir, `${digest}.json`);
+  for (const entry of entries.filter((candidate) => candidate.isFile() && claimDigest(candidate.name) === digest)) {
+    const claim = join(pendingDir, entry.name);
+    try {
+      if ((await fs.stat(claim)).mtimeMs < threshold) await fs.unlink(claim);
+      else await restoreOrDiscardClaim(fs, claim, canonical);
+    } catch {
+      // Keep a discoverable claim for a later Hook.
+    }
+  }
+}
+
+async function cleanPendingDigest(pendingDir, digest, fs, threshold) {
+  await recoverClaimsForDigest(pendingDir, digest, fs, threshold);
+  const canonical = join(pendingDir, `${digest}.json`);
+  try {
+    if ((await fs.stat(canonical)).mtimeMs >= threshold) return;
+  } catch {
+    return;
+  }
+  const claim = join(pendingDir, `.${digest}.json.${process.pid}.${randomUUID()}.cleanup-claim`);
+  try {
+    await fs.rename(canonical, claim);
+  } catch {
+    return;
+  }
+  try {
+    if ((await fs.stat(claim)).mtimeMs < threshold) await fs.unlink(claim);
+    else await restoreOrDiscardClaim(fs, claim, canonical);
+  } catch {
+    await restoreOrDiscardClaim(fs, claim, canonical);
+  }
+}
+
 async function cleanOrphanedPending(runtimeDir, injectedFs = {}) {
-  const fs = { readdir, rename, stat, unlink, link, ...injectedFs };
+  const fs = pendingFileSystem(injectedFs);
   const pendingDir = join(runtimeDir, "pending");
   let entries;
   try {
@@ -58,32 +153,19 @@ async function cleanOrphanedPending(runtimeDir, injectedFs = {}) {
     return;
   }
   const threshold = Date.now() - ORPHAN_AGE_MS;
-  for (const entry of entries.filter((candidate) => candidate.isFile() && /^[a-f0-9]{64}\.json$/.test(candidate.name))) {
-    const canonical = join(pendingDir, entry.name);
-    const claim = join(pendingDir, `.${entry.name}.${process.pid}.${randomUUID()}.cleanup-claim`);
+  const digests = new Set();
+  for (const entry of entries.filter((candidate) => candidate.isFile())) {
+    const canonicalMatch = /^([a-f0-9]{64})\.json$/.exec(entry.name);
+    const digest = canonicalMatch?.[1] ?? claimDigest(entry.name);
+    if (digest) digests.add(digest);
+  }
+  for (const digest of digests) {
+    const lockDir = await acquirePendingLock(pendingDir, digest, injectedFs);
+    if (!lockDir) continue;
     try {
-      await fs.rename(canonical, claim);
-    } catch {
-      continue;
-    }
-    try {
-      if ((await fs.stat(claim)).mtimeMs < threshold) {
-        await fs.unlink(claim);
-        continue;
-      }
-      try {
-        await fs.link(claim, canonical);
-      } catch (error) {
-        if (error?.code !== "EEXIST") throw error;
-      }
-      await fs.unlink(claim);
-    } catch {
-      try {
-        await fs.link(claim, canonical);
-        await fs.unlink(claim);
-      } catch {
-        // A newer canonical wins; otherwise a later cleanup can recover the claim.
-      }
+      await cleanPendingDigest(pendingDir, digest, fs, threshold);
+    } finally {
+      await releasePendingLock(lockDir, injectedFs);
     }
   }
 }
@@ -329,9 +411,12 @@ export async function savePendingTurn(
   const digest = pendingDigest(client, sourceSessionId);
   const target = join(pendingDir, `${digest}.json`);
   const temporary = join(pendingDir, `${digest}.${process.pid}.${randomUUID()}.tmp`);
+  let lockDir;
   try {
     await mkdir(pendingDir, { recursive: true });
     await cleanOrphanedPending(runtimeDir, options.fs);
+    lockDir = await acquirePendingLock(pendingDir, digest, options.fs);
+    if (!lockDir) return false;
     await writeDurable(temporary, JSON.stringify({
       client: String(client).toLowerCase(),
       prompt: typeof prompt === "string" ? prompt : "",
@@ -343,22 +428,35 @@ export async function savePendingTurn(
   } catch {
     try { await removeIfExists(temporary); } catch { /* Fail open. */ }
     return false;
+  } finally {
+    await releasePendingLock(lockDir, options.fs);
   }
 }
 
 export async function takePendingTurn({ client, sourceSessionId }, options = {}) {
   const runtimeDir = runtimePath(options);
   const target = join(runtimeDir, "pending", `${pendingDigest(client, sourceSessionId)}.json`);
-  const claim = join(runtimeDir, "pending", `.${pendingDigest(client, sourceSessionId)}.${process.pid}.${randomUUID()}.take-claim`);
-  const fs = { rename, readFile, unlink, ...options.fs };
+  const digest = pendingDigest(client, sourceSessionId);
+  const pendingDir = join(runtimeDir, "pending");
+  const claim = join(pendingDir, `.${digest}.${process.pid}.${randomUUID()}.take-claim`);
+  const fs = pendingFileSystem(options.fs);
+  let lockDir;
+  let claimed = false;
   try {
+    lockDir = await acquirePendingLock(pendingDir, digest, options.fs);
+    if (!lockDir) return null;
+    await recoverClaimsForDigest(pendingDir, digest, fs, Date.now() - ORPHAN_AGE_MS);
     await fs.rename(target, claim);
-    await cleanOrphanedPending(runtimeDir, options.fs);
+    claimed = true;
     const pending = JSON.parse(await fs.readFile(claim, "utf8"));
     await fs.unlink(claim);
+    claimed = false;
     return pending;
   } catch {
+    if (claimed) await restoreOrDiscardClaim(fs, claim, target);
     return null;
+  } finally {
+    await releasePendingLock(lockDir, options.fs);
   }
 }
 

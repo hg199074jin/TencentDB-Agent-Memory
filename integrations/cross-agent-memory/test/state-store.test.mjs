@@ -134,10 +134,16 @@ test("takePendingTurn claims the old state before a concurrent save and cannot u
       }
     });
     await claimed;
-    await savePendingTurn({ ...key, prompt: "new", skip: false, submittedAt: "2026-08-08T00:00:01.000Z" }, { runtimeDir });
+    const save = savePendingTurn({ ...key, prompt: "new", skip: false, submittedAt: "2026-08-08T00:00:01.000Z" }, { runtimeDir });
+    const saveState = await Promise.race([
+      save.then(() => "completed"),
+      new Promise((resolveWait) => setTimeout(() => resolveWait("waiting"), 50))
+    ]);
     continueTake();
 
     assert.equal((await take).prompt, "old");
+    assert.equal(saveState, "waiting");
+    assert.equal(await save, true);
     assert.equal((await takePendingTurn(key, { runtimeDir })).prompt, "new");
   });
 });
@@ -168,11 +174,101 @@ test("orphan cleanup deletes only its stale claim and preserves a concurrently s
       }
     });
     await claimed;
-    await savePendingTurn({ ...key, prompt: "new", skip: false, submittedAt: new Date().toISOString() }, { runtimeDir });
+    const save = savePendingTurn({ ...key, prompt: "new", skip: false, submittedAt: new Date().toISOString() }, { runtimeDir });
+    const saveState = await Promise.race([
+      save.then(() => "completed"),
+      new Promise((resolveWait) => setTimeout(() => resolveWait("waiting"), 50))
+    ]);
     continueCleanup();
     await cleaningHook;
 
+    assert.equal(saveState, "waiting");
+    assert.equal(await save, true);
     assert.equal((await takePendingTurn(key, { runtimeDir })).prompt, "new");
+  });
+});
+
+test("take waits on a cleanup claim and receives the fresh turn after cleanup restores it", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const key = { client: "codex", sourceSessionId: "fresh-cleanup-gap" };
+    await savePendingTurn({ ...key, prompt: "fresh", skip: false, submittedAt: new Date().toISOString() }, { runtimeDir });
+    const [canonicalName] = (await readdir(join(runtimeDir, "pending"))).filter((name) => name.endsWith(".json"));
+    const canonicalPath = join(runtimeDir, "pending", canonicalName);
+    let releaseClaim;
+    const claimed = new Promise((resolveClaimed) => { releaseClaim = resolveClaimed; });
+    let continueCleanup;
+    const mayRestore = new Promise((resolveRestore) => { continueCleanup = resolveRestore; });
+    const cleaningHook = savePendingTurn({
+      client: "codex", sourceSessionId: "fresh-trigger", prompt: "trigger", skip: false, submittedAt: new Date().toISOString()
+    }, {
+      runtimeDir,
+      fs: {
+        stat: async (path) => {
+          const result = await stat(path);
+          if (path === canonicalPath) return { ...result, mtimeMs: Date.now() - 8 * 24 * 60 * 60 * 1000 };
+          if (path.endsWith(".cleanup-claim")) return { ...result, mtimeMs: Date.now() };
+          return result;
+        },
+        rename: async (from, to) => {
+          await fsRename(from, to);
+          if (from === canonicalPath) {
+            releaseClaim();
+            await mayRestore;
+          }
+        }
+      }
+    });
+    await claimed;
+    const take = takePendingTurn(key, { runtimeDir });
+    const takeState = await Promise.race([
+      take.then(() => "completed"),
+      new Promise((resolveWait) => setTimeout(() => resolveWait("waiting"), 50))
+    ]);
+    continueCleanup();
+
+    await cleaningHook;
+    assert.equal(takeState, "waiting");
+    assert.equal((await take).prompt, "fresh");
+  });
+});
+
+test("take restores its discoverable claim when reading the claimed state fails", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const key = { client: "codex", sourceSessionId: "read-failure" };
+    await savePendingTurn({ ...key, prompt: "recover me", skip: false, submittedAt: new Date().toISOString() }, { runtimeDir });
+
+    assert.equal(await takePendingTurn(key, {
+      runtimeDir,
+      fs: { readFile: async () => { throw new Error("injected read failure"); } }
+    }), null);
+
+    assert.equal((await takePendingTurn(key, { runtimeDir })).prompt, "recover me");
+  });
+});
+
+test("cleanup discovers an unrestored take claim and expires it after seven days", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const key = { client: "codex", sourceSessionId: "expired-claim" };
+    await savePendingTurn({ ...key, prompt: "old secret prompt", skip: false, submittedAt: new Date().toISOString() }, { runtimeDir });
+    await takePendingTurn(key, {
+      runtimeDir,
+      fs: {
+        readFile: async () => { throw new Error("injected read failure"); },
+        link: async () => { throw new Error("injected restore failure"); }
+      }
+    });
+    const pendingDir = join(runtimeDir, "pending");
+    const claimName = (await readdir(pendingDir)).find((name) => name.endsWith(".take-claim"));
+    assert.ok(claimName);
+    const expired = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    await utimes(join(pendingDir, claimName), expired, expired);
+
+    await savePendingTurn({
+      client: "codex", sourceSessionId: "expiry-trigger", prompt: "trigger", skip: false, submittedAt: new Date().toISOString()
+    }, { runtimeDir });
+
+    assert.equal((await readdir(pendingDir)).some((name) => name.endsWith(".take-claim")), false);
+    assert.equal(await takePendingTurn(key, { runtimeDir }), null);
   });
 });
 
