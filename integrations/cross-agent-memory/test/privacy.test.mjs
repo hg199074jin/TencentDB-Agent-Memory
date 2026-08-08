@@ -32,6 +32,30 @@ test("credential detection recognizes bearer and common token prefixes", () => {
   assert.equal(containsCredential("no secret is present"), false);
 });
 
+test("credential detection recognizes assigned English and Chinese secrets without matching prose", () => {
+  for (const value of [
+    "password=hunter2",
+    "password : hunter2",
+    "PASSWORD＝hunter2",
+    "密码：hunter2",
+    "密码 = hunter2",
+    "token=plain-secret-value",
+    "token ： plain-secret-value"
+  ]) {
+    assert.equal(containsCredential(value), true, value);
+    assert.equal(inspectTurn(value, "ordinary reply").skip, true, value);
+  }
+
+  for (const value of [
+    "The password policy requires twelve characters.",
+    "Rotate the token after deployment.",
+    "A password manager stores credentials.",
+    "The token budget is 1000."
+  ]) {
+    assert.equal(containsCredential(value), false, value);
+  }
+});
+
 test("base64 media is removed without retaining the payload", () => {
   const result = inspectTurn("看图 data:image/png;base64," + "A".repeat(500), "完成");
   assert.equal(result.skip, false);

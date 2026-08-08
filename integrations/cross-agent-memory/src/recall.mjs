@@ -61,9 +61,18 @@ export async function recallCrossSession(client, prompt, recall) {
 
   const maxChars = recall.maxContextChars;
   const availableChars = maxChars - OPEN.length - NOTICE.length - CLOSE.length;
+  const sections = [
+    ["用户画像 (L3)", l3Values],
+    ["相关记忆 (L1)", l1Values],
+    ["对话历史 (L0)", l0Values]
+  ].filter(([, values]) => values.length > 0);
+  const sectionBudget = Math.floor(availableChars / sections.length);
   let body = "";
-  body = appendSection(body, "用户画像 (L3)", l3Values, availableChars);
-  body = appendSection(body, "相关记忆 (L1)", l1Values, availableChars);
-  body = appendSection(body, "对话历史 (L0)", l0Values, availableChars);
+  for (const [index, [title, values]] of sections.entries()) {
+    const budget = index === sections.length - 1
+      ? availableChars - sectionBudget * index
+      : sectionBudget;
+    body += appendSection("", title, values, budget);
+  }
   return body ? `${OPEN}${NOTICE}${body}${CLOSE}` : "";
 }

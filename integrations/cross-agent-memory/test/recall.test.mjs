@@ -98,3 +98,24 @@ test("recallCrossSession truncates an oversized L3 profile inside one valid boun
   assertBoundedXml(result, maxContextChars, "用户画像 (L3)");
   assert.match(result, /L3 &lt;profile&gt; &amp; detail/);
 });
+
+test("recallCrossSession reserves room for the first L0 hit beside oversized L3 and L1 context", async () => {
+  const maxContextChars = 480;
+  const result = await recallCrossSession({
+    searchConversation: async () => ({ messages: [
+      { content: "L0 must survive <current> & evidence." },
+      { content: "second L0 result" }
+    ] }),
+    searchAtomic: async () => ({ items: [{ content: "L1 useful context ".repeat(100) }] }),
+    readCore: async () => ({ content: "L3 useful profile ".repeat(100) })
+  }, "question", { ...recall, maxContextChars });
+
+  assert.ok(result.length <= maxContextChars);
+  assert.equal((result.match(/<cross-agent-memory/g) ?? []).length, 1);
+  assert.equal((result.match(/<\/cross-agent-memory>/g) ?? []).length, 1);
+  assert.equal(/&(?!amp;|lt;|gt;)/.test(result), false);
+  assert.equal(/<(?!\/?cross-agent-memory\b)/.test(result), false);
+  assert.match(result, /L3 useful profile/);
+  assert.match(result, /L1 useful context/);
+  assert.match(result, /L0 must survive &lt;current&gt; &amp; evidence\./);
+});

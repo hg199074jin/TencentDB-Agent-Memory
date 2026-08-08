@@ -6,6 +6,7 @@ const CREDENTIAL_PATTERNS = [
   /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/i,
   /\bBearer\s+[A-Za-z0-9._~+/=-]+/i,
   /\b(?:api[_-]?key|access[_-]?token|secret[_-]?key)\s*[:=]\s*[^\s,;]+/i,
+  /(?:\b(?:password|passwd|pwd|token)\b|密码)\s*[:=：＝]\s*[^\s,;，；:=：＝]+/iu,
   /\bsk-[A-Za-z0-9_-]+/i,
   /\bghp_[A-Za-z0-9]+/i,
   /\bgithub_pat_[A-Za-z0-9_]+/i
