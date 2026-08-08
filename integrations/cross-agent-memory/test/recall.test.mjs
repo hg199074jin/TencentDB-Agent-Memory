@@ -53,3 +53,48 @@ test("recallCrossSession preserves successful sources when another source reject
   assert.equal(partial.includes("对话历史 (L0)"), false);
   assert.equal(await recallCrossSession(allFailures, "question", recall), "");
 });
+
+function assertBoundedXml(result, maxContextChars, heading) {
+  assert.ok(result.length <= maxContextChars);
+  assert.match(result, new RegExp(`## ${heading.replace(/[()]/g, "\\$&")}`));
+  assert.equal((result.match(/<cross-agent-memory/g) ?? []).length, 1);
+  assert.equal((result.match(/<\/cross-agent-memory>/g) ?? []).length, 1);
+  assert.equal(/&(?!amp;|lt;|gt;)/.test(result), false);
+  assert.equal(/<(?!\/?cross-agent-memory\b)/.test(result), false);
+}
+
+test("recallCrossSession truncates an oversized L0 memory inside one valid bounded XML block", async () => {
+  const maxContextChars = 360;
+  const result = await recallCrossSession({
+    searchConversation: async () => ({ messages: [{ content: "L0 <memory> & detail ".repeat(100) }] }),
+    searchAtomic: async () => ({ items: [] }),
+    readCore: async () => ({ content: null })
+  }, "question", { ...recall, maxContextChars });
+
+  assertBoundedXml(result, maxContextChars, "对话历史 (L0)");
+  assert.match(result, /L0 &lt;memory&gt; &amp; detail/);
+});
+
+test("recallCrossSession truncates an oversized L1 memory inside one valid bounded XML block", async () => {
+  const maxContextChars = 360;
+  const result = await recallCrossSession({
+    searchConversation: async () => ({ messages: [] }),
+    searchAtomic: async () => ({ items: [{ content: "L1 <memory> & detail ".repeat(100) }] }),
+    readCore: async () => ({ content: null })
+  }, "question", { ...recall, maxContextChars });
+
+  assertBoundedXml(result, maxContextChars, "相关记忆 (L1)");
+  assert.match(result, /L1 &lt;memory&gt; &amp; detail/);
+});
+
+test("recallCrossSession truncates an oversized L3 profile inside one valid bounded XML block", async () => {
+  const maxContextChars = 360;
+  const result = await recallCrossSession({
+    searchConversation: async () => ({ messages: [] }),
+    searchAtomic: async () => ({ items: [] }),
+    readCore: async () => ({ content: "L3 <profile> & detail ".repeat(100) })
+  }, "question", { ...recall, maxContextChars });
+
+  assertBoundedXml(result, maxContextChars, "用户画像 (L3)");
+  assert.match(result, /L3 &lt;profile&gt; &amp; detail/);
+});

@@ -21,9 +21,28 @@ function unique(values, known) {
   });
 }
 
-function section(title, values) {
-  if (values.length === 0) return "";
-  return `## ${title}\n${values.map((value) => `- ${escapeXml(value)}`).join("\n")}\n`;
+function truncateEscaped(value, maxChars) {
+  let output = "";
+  for (const character of value) {
+    const escaped = escapeXml(character);
+    if (output.length + escaped.length > maxChars) break;
+    output += escaped;
+  }
+  return output;
+}
+
+function appendSection(body, title, values, availableChars) {
+  if (values.length === 0) return body;
+  const heading = `## ${title}\n`;
+  const first = truncateEscaped(values[0], availableChars - body.length - heading.length - 3);
+  if (!first) return body;
+  let output = `${body}${heading}- ${first}\n`;
+  for (const value of values.slice(1)) {
+    const fragment = truncateEscaped(value, availableChars - output.length - 3);
+    if (!fragment) break;
+    output += `- ${fragment}\n`;
+  }
+  return output;
 }
 
 export async function recallCrossSession(client, prompt, recall) {
@@ -41,15 +60,10 @@ export async function recallCrossSession(client, prompt, recall) {
   if (l3Values.length + l1Values.length + l0Values.length === 0) return "";
 
   const maxChars = recall.maxContextChars;
+  const availableChars = maxChars - OPEN.length - NOTICE.length - CLOSE.length;
   let body = "";
-  for (const next of [
-    section("用户画像 (L3)", l3Values),
-    section("相关记忆 (L1)", l1Values),
-    section("对话历史 (L0)", l0Values)
-  ]) {
-    if (next && (OPEN.length + NOTICE.length + body.length + next.length + CLOSE.length) <= maxChars) {
-      body += next;
-    }
-  }
+  body = appendSection(body, "用户画像 (L3)", l3Values, availableChars);
+  body = appendSection(body, "相关记忆 (L1)", l1Values, availableChars);
+  body = appendSection(body, "对话历史 (L0)", l0Values, availableChars);
   return body ? `${OPEN}${NOTICE}${body}${CLOSE}` : "";
 }

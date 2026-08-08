@@ -34,6 +34,7 @@ async function withGateway(handler, run) {
   try {
     await run({ ...config, endpoint: `http://127.0.0.1:${port}` });
   } finally {
+    server.closeAllConnections();
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
 }
@@ -95,5 +96,85 @@ test("GatewayClient rejects unsafe transport and envelope failures without expos
         (error) => error instanceof Error && error.message.length < 200 && !error.message.includes("local-test-key")
       );
     });
+  }
+});
+
+test("GatewayClient requires every field of a successful v3 envelope", async () => {
+  const incompleteEnvelopes = [
+    { code: 0, request_id: "req-1", data: {} },
+    { code: 0, message: "ok", data: {} },
+    { code: 0, message: "ok", request_id: "req-1" }
+  ];
+
+  for (const envelope of incompleteEnvelopes) {
+    await withGateway((_request, response) => response.end(JSON.stringify(envelope)), async (clientConfig) => {
+      await assert.rejects(
+        () => new GatewayClient(clientConfig).readCore(),
+        (error) => error instanceof Error && error.message.length < 200 && !error.message.includes("local-test-key")
+      );
+    });
+  }
+});
+
+test("GatewayClient queries one explicit session for retry deduplication", async () => {
+  const requests = [];
+  await withGateway(async (request, response) => {
+    requests.push({ path: request.url, headers: request.headers, body: await readBody(request) });
+    response.end(JSON.stringify({ code: 0, message: "ok", request_id: "req-query", data: { messages: [] } }));
+  }, async (clientConfig) => {
+    const client = new GatewayClient(clientConfig);
+    await client.queryConversation("codex-session-1", 20);
+    await assert.rejects(() => client.queryConversation(""), /session/i);
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].path, "/v3/conversation/query");
+  assert.equal(requests[0].headers.authorization, "Bearer local-test-key");
+  assert.equal(requests[0].headers["x-tdai-service-id"], "default");
+  assert.equal(requests[0].headers["content-type"], "application/json");
+  assert.deepEqual(requests[0].body, {
+    team_id: "team-personal",
+    agent_id: "agent-personal",
+    user_id: "user-jin",
+    task_id: "task-test",
+    session_id: "codex-session-1",
+    limit: 20
+  });
+});
+
+test("GatewayClient uses the capture timeout for conversation writes", async () => {
+  await withGateway(async (_request, response) => {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    response.end(JSON.stringify({ code: 0, message: "ok", request_id: "req-delay", data: {} }));
+  }, async (clientConfig) => {
+    const client = new GatewayClient({
+      ...clientConfig,
+      timeouts: { recallMs: 25, captureMs: 250 }
+    });
+    await assert.rejects(() => client.readCore(), /timeout/);
+    await client.addConversation("codex-session-1", []);
+  });
+});
+
+test("GatewayClient rejects missing or blank connection and identity configuration before a request", () => {
+  const missingFields = [
+    ["endpoint", (value, replacement) => { value.endpoint = replacement; }],
+    ["apiKey", (value, replacement) => { value.apiKey = replacement; }],
+    ["serviceId", (value, replacement) => { value.serviceId = replacement; }],
+    ["teamId", (value, replacement) => { value.identity.teamId = replacement; }],
+    ["agentId", (value, replacement) => { value.identity.agentId = replacement; }],
+    ["userId", (value, replacement) => { value.identity.userId = replacement; }],
+    ["taskId", (value, replacement) => { value.identity.taskId = replacement; }]
+  ];
+
+  for (const [field, replace] of missingFields) {
+    for (const invalidValue of [undefined, " "]) {
+      const invalid = structuredClone(config);
+      replace(invalid, invalidValue);
+      assert.throws(
+        () => new GatewayClient(invalid),
+        (error) => error instanceof Error && error.message.includes(field) && !error.message.includes("local-test-key")
+      );
+    }
   }
 });

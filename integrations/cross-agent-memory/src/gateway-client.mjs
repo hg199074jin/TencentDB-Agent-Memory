@@ -6,9 +6,28 @@ function requestError(detail) {
   return new Error(`Memory gateway request failed: ${detail}`);
 }
 
+function requiredString(value, field) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`Invalid gateway config: ${field} is required`);
+  }
+  return value.trim();
+}
+
 export class GatewayClient {
   constructor(config) {
-    this.config = config;
+    const identity = config?.identity ?? {};
+    this.config = {
+      ...config,
+      endpoint: requiredString(config?.endpoint, "endpoint"),
+      apiKey: requiredString(config?.apiKey, "apiKey"),
+      serviceId: requiredString(config?.serviceId, "serviceId"),
+      identity: {
+        teamId: requiredString(identity.teamId, "teamId"),
+        agentId: requiredString(identity.agentId, "agentId"),
+        userId: requiredString(identity.userId, "userId"),
+        taskId: requiredString(identity.taskId, "taskId")
+      }
+    };
   }
 
   async searchConversation(query, limit) {
@@ -16,6 +35,9 @@ export class GatewayClient {
   }
 
   async queryConversation(sessionId, limit = 20) {
+    if (typeof sessionId !== "string" || sessionId.trim() === "") {
+      throw requestError("missing query session");
+    }
     return this.#post(
       "/v3/conversation/query",
       { session_id: sessionId, limit },
@@ -78,7 +100,15 @@ export class GatewayClient {
       } catch {
         throw requestError("invalid JSON response");
       }
-      if (!envelope || typeof envelope !== "object" || typeof envelope.code !== "number") {
+      if (
+        !envelope
+        || typeof envelope !== "object"
+        || Array.isArray(envelope)
+        || typeof envelope.code !== "number"
+        || typeof envelope.message !== "string"
+        || typeof envelope.request_id !== "string"
+        || !Object.hasOwn(envelope, "data")
+      ) {
         throw requestError("invalid response envelope");
       }
       if (envelope.code !== 0) {
