@@ -137,7 +137,7 @@ test("captureTurn aborts a request by the aggregate deadline and durably spools 
   });
 });
 
-test("retryQueuedCaptures removes a record when query finds both messages within two seconds", async () => {
+test("retryQueuedCaptures removes a record when query finds both role and content matches", async () => {
   await withRuntime(async (runtimeDir) => {
     await enqueueCapture({
       memorySessionId: "codex-session",
@@ -166,6 +166,62 @@ test("retryQueuedCaptures removes a record when query finds both messages within
 
     assert.deepEqual(result, { processed: 1, removed: 1, remaining: 0, budgetExceeded: false });
     assert.equal(writes, 0);
+  });
+});
+
+test("retryQueuedCaptures removes a record when the server rewrites matching message timestamps", async () => {
+  await withRuntime(async (runtimeDir) => {
+    await enqueueCapture({
+      memorySessionId: "codex-session",
+      messages: [
+        { role: "user", content: "same user", timestamp: "2026-08-08T00:00:00.000Z" },
+        { role: "assistant", content: "same assistant", timestamp: "2026-08-08T00:00:01.000Z" }
+      ]
+    }, { runtimeDir });
+    let writes = 0;
+    const result = await retryQueuedCaptures({
+      gatewayClient: {
+        queryConversation: async () => ({ messages: [
+          { role: "assistant", content: "same assistant", timestamp: "2026-08-08T00:00:46.000Z" },
+          { role: "user", content: "same user", timestamp: "2026-08-08T00:00:31.000Z" }
+        ] }),
+        addConversation: async () => { writes += 1; }
+      },
+      retryBatchSize: 3,
+      retryBudgetMs: 800,
+      runtimeDir
+    });
+
+    assert.deepEqual(result, { processed: 1, removed: 1, remaining: 0, budgetExceeded: false });
+    assert.equal(writes, 0);
+  });
+});
+
+test("retryQueuedCaptures preserves queued message multiplicity when only one duplicate exists", async () => {
+  await withRuntime(async (runtimeDir) => {
+    await enqueueCapture({
+      memorySessionId: "codex-session",
+      messages: [
+        { role: "user", content: "repeat", timestamp: "2026-08-08T00:00:00.000Z" },
+        { role: "user", content: "repeat", timestamp: "2026-08-08T00:00:01.000Z" }
+      ]
+    }, { runtimeDir });
+    let writes = 0;
+    const result = await retryQueuedCaptures({
+      gatewayClient: {
+        queryConversation: async () => ({ messages: [
+          { role: "user", content: "repeat", timestamp: "2026-08-08T00:00:45.000Z" },
+          { role: "user", content: "repeat ", timestamp: "2026-08-08T00:00:46.000Z" }
+        ] }),
+        addConversation: async () => { writes += 1; }
+      },
+      retryBatchSize: 3,
+      retryBudgetMs: 800,
+      runtimeDir
+    });
+
+    assert.deepEqual(result, { processed: 1, removed: 1, remaining: 0, budgetExceeded: false });
+    assert.equal(writes, 1);
   });
 });
 

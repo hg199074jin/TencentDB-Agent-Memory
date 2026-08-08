@@ -6,7 +6,6 @@ import {
 } from "./state-store.mjs";
 
 const MAX_RETRY_BATCH = 3;
-const DEDUPE_WINDOW_MS = 2_000;
 const DURABLE_SPOOL_RESERVE_MS = 700;
 
 function isoTimestamp(value, fallback) {
@@ -14,23 +13,14 @@ function isoTimestamp(value, fallback) {
   return Number.isFinite(timestamp.getTime()) ? timestamp.toISOString() : new Date(fallback).toISOString();
 }
 
-function messageTimestamp(message) {
-  return message?.timestamp ?? message?.created_at ?? message?.createdAt;
-}
-
 function isDuplicate(messages, queuedMessages) {
   if (!Array.isArray(messages) || !Array.isArray(queuedMessages) || queuedMessages.length === 0) return false;
   const used = new Set();
   return queuedMessages.every((queued) => {
-    const queuedTime = new Date(messageTimestamp(queued)).getTime();
-    if (!Number.isFinite(queuedTime)) return false;
     const index = messages.findIndex((candidate, candidateIndex) => {
       if (used.has(candidateIndex)) return false;
-      const candidateTime = new Date(messageTimestamp(candidate)).getTime();
       return candidate?.role === queued.role &&
-        candidate?.content === queued.content &&
-        Number.isFinite(candidateTime) &&
-        Math.abs(candidateTime - queuedTime) <= DEDUPE_WINDOW_MS;
+        candidate?.content === queued.content;
     });
     if (index < 0) return false;
     used.add(index);
