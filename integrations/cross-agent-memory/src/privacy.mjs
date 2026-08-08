@@ -17,7 +17,7 @@ function asText(value) {
 
 export function hasNoMemoryDirective(text) {
   const value = asText(text);
-  return /\[不记忆\]/i.test(value) || /(?:^|\s)\/nomemory(?=$|\s)/i.test(value);
+  return /\[不记忆\]/i.test(value) || /\/nomemory(?![\p{L}\p{N}_])/iu.test(value);
 }
 
 export function containsCredential(text) {

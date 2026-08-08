@@ -12,8 +12,10 @@ test("skip directive disables recall and capture", () => {
   assert.equal(inspectTurn("/nomemory 这轮不要保存", "答复").skip, true);
 });
 
-test("opt-out directives are case-insensitive and do not match embedded words", () => {
+test("opt-out directives accept punctuation boundaries but not embedded words", () => {
   assert.equal(hasNoMemoryDirective("Please use /NoMemory for this turn"), true);
+  assert.equal(hasNoMemoryDirective("/nomemory，别保存"), true);
+  assert.equal(hasNoMemoryDirective("请用/nomemory。"), true);
   assert.equal(hasNoMemoryDirective("keep /nomemorynotes in the title"), false);
 });
 
@@ -24,6 +26,7 @@ test("a detected credential skips the whole turn", () => {
 
 test("credential detection recognizes bearer and common token prefixes", () => {
   assert.equal(containsCredential("Authorization: Bearer example-token-value"), true);
+  assert.equal(containsCredential("The token is sk-" + "a".repeat(32)), true);
   assert.equal(containsCredential("token=ghp_" + "a".repeat(36)), true);
   assert.equal(containsCredential("github_pat_" + "a".repeat(22)), true);
   assert.equal(containsCredential("no secret is present"), false);
