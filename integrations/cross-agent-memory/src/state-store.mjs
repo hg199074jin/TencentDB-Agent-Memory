@@ -90,6 +90,10 @@ function claimDigest(name) {
   return /^\.?([a-f0-9]{64})(?:\.json)?\.\d+\.[0-9a-f-]+\.(?:take|cleanup)-claim$/.exec(name)?.[1];
 }
 
+function pendingTempDigest(name) {
+  return /^([a-f0-9]{64})\.\d+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/.exec(name)?.[1];
+}
+
 async function restoreOrDiscardClaim(fs, claim, canonical) {
   try {
     await fs.link(claim, canonical);
@@ -165,6 +169,15 @@ async function cleanOrphanedPending(runtimeDir, injectedFs = {}) {
   }
   const threshold = Date.now() - ORPHAN_AGE_MS;
   const deadline = Date.now() + PENDING_CLEANUP_BUDGET_MS;
+  for (const entry of entries.filter((candidate) => candidate.isFile() && pendingTempDigest(candidate.name))) {
+    if (Date.now() >= deadline) break;
+    const temporary = join(pendingDir, entry.name);
+    try {
+      if ((await fs.stat(temporary)).mtimeMs < threshold) await fs.unlink(temporary);
+    } catch {
+      // Never promote a failed temp deletion; retry the same recognizable file later.
+    }
+  }
   const digests = new Set();
   for (const entry of entries.filter((candidate) => candidate.isFile())) {
     const canonicalMatch = /^([a-f0-9]{64})\.json$/.exec(entry.name);

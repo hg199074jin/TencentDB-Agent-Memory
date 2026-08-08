@@ -333,6 +333,64 @@ test("global cleanup has one aggregate budget across many locked sessions withou
   });
 });
 
+test("cleanup removes only stale adapter-owned pending temps and preserves fresh or unrelated temps", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const pendingDir = join(runtimeDir, "pending");
+    await mkdir(pendingDir, { recursive: true });
+    const digest = "b".repeat(64);
+    const staleName = `${digest}.1234.00000000-0000-4000-8000-000000000001.tmp`;
+    const freshName = `${digest}.1235.00000000-0000-4000-8000-000000000002.tmp`;
+    const unrelatedName = `${digest}.not-a-pid.00000000-0000-4000-8000-000000000003.tmp`;
+    await writeFile(join(pendingDir, staleName), "stale raw prompt", "utf8");
+    await writeFile(join(pendingDir, freshName), "fresh raw prompt", "utf8");
+    await writeFile(join(pendingDir, unrelatedName), "unrelated content", "utf8");
+    const expired = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    await utimes(join(pendingDir, staleName), expired, expired);
+    await utimes(join(pendingDir, unrelatedName), expired, expired);
+
+    await savePendingTurn({
+      client: "codex", sourceSessionId: "temp-cleanup-trigger", prompt: "trigger", skip: false, submittedAt: new Date().toISOString()
+    }, { runtimeDir });
+
+    await assert.rejects(() => access(join(pendingDir, staleName)));
+    assert.equal(await readFile(join(pendingDir, freshName), "utf8"), "fresh raw prompt");
+    assert.equal(await readFile(join(pendingDir, unrelatedName), "utf8"), "unrelated content");
+    assert.equal((await readdir(pendingDir)).includes(`${digest}.json`), false);
+  });
+});
+
+test("failed stale pending-temp deletion leaves it quarantined for the next cleanup", async () => {
+  await withRuntime(async (runtimeDir) => {
+    const pendingDir = join(runtimeDir, "pending");
+    await mkdir(pendingDir, { recursive: true });
+    const digest = "c".repeat(64);
+    const tempName = `${digest}.4321.00000000-0000-4000-8000-000000000004.tmp`;
+    const tempPath = join(pendingDir, tempName);
+    await writeFile(tempPath, "retry raw prompt", "utf8");
+    const expired = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    await utimes(tempPath, expired, expired);
+
+    await savePendingTurn({
+      client: "codex", sourceSessionId: "temp-failure-trigger", prompt: "trigger", skip: false, submittedAt: new Date().toISOString()
+    }, {
+      runtimeDir,
+      fs: {
+        unlink: async (path) => {
+          if (path === tempPath) throw new Error("injected temp unlink failure");
+          return rm(path);
+        }
+      }
+    });
+    assert.equal(await readFile(tempPath, "utf8"), "retry raw prompt");
+    assert.equal((await readdir(pendingDir)).includes(`${digest}.json`), false);
+
+    await savePendingTurn({
+      client: "codex", sourceSessionId: "temp-retry-trigger", prompt: "trigger", skip: false, submittedAt: new Date().toISOString()
+    }, { runtimeDir });
+    await assert.rejects(() => access(tempPath));
+  });
+});
+
 test("enqueueCapture persists one JSON object per line without unrelated secrets", async () => {
   await withRuntime(async (runtimeDir) => {
     const queued = await enqueueCapture({
