@@ -61,7 +61,7 @@ node src/doctor.mjs
 
 各步骤的作用：
 
-1. `bootstrap-config` 从现有本地部署读取 Gateway 地址和认证材料，写入固定的共用身份。
+1. `bootstrap-config` 从现有本地部署读取 Gateway 地址和认证材料，创建或复用固定的正式 Metadata 身份，随后才写入配置。
 2. 第一次 `doctor` 检查 Node、配置、Gateway 以及 L0/L1/L3。
 3. `install-hooks` 只给三个客户端增加两项记忆 Hook，并把原配置备份到 D 盘。
 4. 第二次 `doctor` 再确认三个客户端都注册成功。
@@ -74,6 +74,18 @@ node src/bootstrap-config.mjs --force
 
 使用 `--force` 前，原文件会先按原始字节备份到 `runtime\backups`。如果 Gateway 没启动，或者固定身份不被当前服务接受，引导程序会停止，不会写入半成品配置，也不要继续安装 Hook。
 
+### 正式 Metadata 身份
+
+这套适配器不使用临时、按客户端拆分的身份。引导程序会在当前登录用户下创建或精确复用以下一组 Metadata 对象，并把服务生成的 ID 写进 `config.local.json`：
+
+| 对象 | 固定名称 | 关系 |
+| --- | --- | --- |
+| Team | `个人跨 Agent 记忆` | 当前用户拥有 |
+| Agent | `共享个人助手` | 属于上述 Team，当前用户拥有 |
+| Task | `日常共享对话` | 属于上述 Team，并关联上述 Agent |
+
+不要手工改写 `config.local.json` 中的 `identity`。若必须重建，使用 `bootstrap-config.mjs --force`；它会先备份旧文件，且只有 Gateway 和 Metadata 关系都验证成功后才替换。重复运行 `install-hooks.mjs install` 不会修改这组正式身份，也不会改写 Claude Code 的模型或供应商字段。
+
 ## 安装后还要做两件小事
 
 ### Codex
@@ -84,7 +96,18 @@ node src/bootstrap-config.mjs --force
 
 安装后请新开一个 ZCode 会话。已经打开的旧会话可能仍使用安装前的配置。
 
-Claude Code 不需要改模型地址；原有 MiniMax 环境变量和模型设置都会保留。
+Claude Code 不需要改模型地址；原有 MiniMax 环境变量、模型和供应商字段都会保留。
+
+### Claude Code 恢复 MiniMax 直连
+
+如果此前曾让 Claude Code 指向 `8096` Proxy，先退出 Claude Code，再从**已核验的、原始 MiniMax 直连设置备份**恢复。该命令只合并 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN`，会删除 Proxy 专用的 `ANTHROPIC_CUSTOM_HEADERS`，并在替换前备份当前 `settings.json`：
+
+```powershell
+Set-Location D:\TencentDB-Agent-Memory\integrations\cross-agent-memory
+node src/restore-claude-minimax.mjs 'D:\可信备份\settings.json'
+```
+
+可信来源必须是 `ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic` 且包含非空 MiniMax Token 的 JSON 文件。不要把 token 粘贴到终端、文档或 issue 中。恢复后新开 Claude Code 会话并运行一次 `node src/doctor.mjs`。
 
 ## 日常使用
 
@@ -105,9 +128,22 @@ Claude Code 不需要改模型地址；原有 MiniMax 环境变量和模型设�
 
 Memory Hub 启动后，在浏览器打开：
 
-[http://localhost:8125](http://localhost:8125)
+[http://localhost:8125/memory](http://localhost:8125/memory)
 
-这里主要用于查看 L0、L1 和 L3 是否已经产生。MVP 不使用 Skill、Wiki 或 CodeGraph。
+这是 **资产管理 → Chat_Memory** 的页面。先切换到 `个人跨 Agent 记忆` Team，再选择 `共享个人助手`；首轮成功写入后，应能看到该正式身份对应的 `chat_memory` 资产及其 L0–L3 内容。若首写后仍不可见，先运行 `node src/doctor.mjs`：`identity` 必须是 PASS，`chat-memory` 才可为 PASS；在尚未首写时显示 WAIT 是预期结果。MVP 不使用 Skill、Wiki 或 CodeGraph。
+
+## 旧数据与 Proxy
+
+本次接入只使用新的正式 Metadata 身份来承接**之后**的新会话：不会迁移、重命名、删除或覆盖旧的对话、旧资产、容器、镜像和卷。旧数据仍按原来的身份和位置保留；如需历史数据迁移，应另行使用项目迁移工具并先备份，不要把它混入 Hook 安装步骤。
+
+确认 Codex、Claude Code、ZCode 的活跃模型配置均已不再指向 `http://127.0.0.1:8096`（Claude 还应按上一节恢复为 MiniMax 直连）后，才可以在正式部署目录停止 Proxy：
+
+```powershell
+Set-Location D:\TencentDB-Agent-Memory\deploy\global-images
+docker stop tdai-proxy
+```
+
+这只停止容器，**不要**删除容器、镜像或卷。需要回滚到 Proxy 路由时，保留原配置并执行 `docker start tdai-proxy`，再从各客户端对应的操作前备份恢复其 Proxy 设置；恢复后新开客户端并运行 `node src/doctor.mjs`。本说明不代表已经执行过停止或回滚。
 
 ## MemoryCore 暂停时会怎样
 
@@ -137,7 +173,7 @@ D:\TencentDB-Agent-Memory\integrations\cross-agent-memory\runtime\backups\
 node src/doctor.mjs
 ```
 
-它逐项显示 PASS 或 FAIL：配置、Node、Gateway、L0、L1、L3、可选写入状态，以及 Codex、Claude Code、ZCode 的 Hook 注册。
+它逐项显示 PASS、FAIL 或 WAIT：配置、Node、Gateway、L0、L1、L3、正式身份、Hub `chat_memory` 资产、可选写入状态，以及 Codex、Claude Code、ZCode 的 Hook 注册。
 
 只有确实需要验证写入接口时，才运行：
 
@@ -188,18 +224,43 @@ config.local.json
 
 ## 仓库或客户端升级后
 
-不要直接重装。先在正式目录运行固定回归：
+不要直接重装。先在正式目录完成升级自检；这些命令只检查代码和本机适配器配置，不会启动、停止或删除 Docker 服务：
 
 ```powershell
 Set-Location D:\TencentDB-Agent-Memory\integrations\cross-agent-memory
 npm test
+node --check src\bootstrap-config.mjs
+node --check src\install-hooks.mjs
+node --check src\doctor.mjs
+node --check src\restore-claude-minimax.mjs
 node src/doctor.mjs
 ```
 
-然后：
+通过后再重复安装一次并复查，确认安装器保持幂等：
+
+```powershell
+node src/install-hooks.mjs install
+node src/install-hooks.mjs install
+node src/doctor.mjs
+```
+
+第二次安装不应产生新的 Hook、备份或任何 Claude 模型/供应商字段、`config.local.json` 正式身份的变更。若 `doctor` 的 `identity` 为 FAIL，停止后续安装，先用 `bootstrap-config.mjs --force` 按正式身份章节重建并验证。
+
+## 真实验收（待用户执行）
+
+自动测试和 `doctor` 不能替代真实客户端会话验收。以下步骤需要用户在三个客户端分别新开会话完成；本仓库不声称它们已完成：
+
+1. 在 Codex 新会话写入一条无敏感信息、可辨认的测试偏好，等待本轮结束。
+2. 在 Hub 的 [Chat_Memory 页面](http://localhost:8125/memory)确认正式身份的 `chat_memory` 资产可读；随后运行 `node src/doctor.mjs`，确认 `identity` 与 `chat-memory` 均为 PASS。
+3. 分别新开 Claude Code 和 ZCode 会话，确认能收到该测试偏好；Claude Code 还应确认仍直连 MiniMax，而非 `8096`。
+4. 验收后可在任一客户端补充一条无敏感测试信息并跨端检查一次；不要用真实密码、Token、私钥或业务机密作测试内容。
+
+验收失败时，先保留现场并记录 `doctor` 中不含内容的状态；只对失败客户端执行精确卸载或从操作前备份恢复，避免影响另两个客户端。
+
+升级后还应：
 
 1. 各向 Codex、Claude Code、ZCode 的 Hook CLI 做一次离线烟雾检查。
-2. 只做一次 Codex 到 ZCode 的真实跨端召回。
+2. 按上面的真实验收步骤完成一次跨端召回。
 3. 若仅一个客户端失败，只卸载该客户端的 Hook，另外两个继续使用。
 4. Codex 升级后再看 `/hooks` 信任状态；ZCode 升级或重装 Hook 后新开会话。
 

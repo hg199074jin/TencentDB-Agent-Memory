@@ -239,6 +239,53 @@ test("install creates missing configs, is idempotent, and does not add backups w
   });
 });
 
+test("reinstall preserves Claude direct provider fields and the established official adapter identity", async () => {
+  await withSandbox(async ({ root, userProfile, runtimeDir }) => {
+    const claudePath = join(userProfile, ".claude", "settings.json");
+    const adapterRoot = join(root, "adapter");
+    const adapterPath = join(adapterRoot, "src", "hook-cli.mjs");
+    const adapterConfigPath = join(adapterRoot, "config.local.json");
+    const claudeOriginal = {
+      model: "MiniMax-M2.1",
+      provider: "minimax",
+      env: {
+        ANTHROPIC_BASE_URL: "https://api.minimaxi.com/anthropic",
+        ANTHROPIC_AUTH_TOKEN: "direct-minimax-token",
+        ANTHROPIC_CUSTOM_HEADERS: "x-client: claude-code"
+      }
+    };
+    const officialAdapterConfig = {
+      endpoint: "http://127.0.0.1:8420",
+      apiKey: "local-bearer-disabled-compatibility",
+      serviceId: "default",
+      identity: {
+        userId: "usr-official",
+        teamId: "team-official",
+        agentId: "agt-official",
+        taskId: "task-official"
+      }
+    };
+    await writeJson(claudePath, claudeOriginal);
+    await writeJson(adapterConfigPath, officialAdapterConfig);
+    const adapterConfigBytes = await readFile(adapterConfigPath, "utf8");
+
+    await installHooks({ client: "claude", userProfile, runtimeDir, adapterPath });
+    const result = await installHooks({ client: "claude", userProfile, runtimeDir, adapterPath });
+
+    const claude = await readJson(claudePath);
+    assert.equal(claude.model, claudeOriginal.model);
+    assert.equal(claude.provider, claudeOriginal.provider);
+    assert.deepEqual(claude.env, claudeOriginal.env);
+    for (const event of ["UserPromptSubmit", "Stop"]) {
+      assert.equal(claude.hooks[event].filter((block) =>
+        block.hooks?.some((entry) => entry.command === `node "${adapterPath}" claude`)
+      ).length, 1);
+    }
+    assert.deepEqual(result, { changed: [], backupDir: null });
+    assert.equal(await readFile(adapterConfigPath, "utf8"), adapterConfigBytes);
+  });
+});
+
 test("uninstall removes only this exact adapter path and preserves later user changes", async () => {
   await withSandbox(async ({ userProfile, runtimeDir }) => {
     await installHooks({ userProfile, runtimeDir, adapterPath: ADAPTER_PATH });
