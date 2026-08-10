@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 
 import { loadConfig } from "./config.mjs";
 import { GatewayClient } from "./gateway-client.mjs";
+import { HubClient } from "./hub-client.mjs";
 import { MetadataClient } from "./metadata-client.mjs";
+import { OFFICIAL_IDENTITY_NAMES } from "./bootstrap-config.mjs";
 
 const DEFAULT_ROOT_DIR = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_ADAPTER_PATH = fileURLToPath(new URL("./hook-cli.mjs", import.meta.url));
@@ -126,10 +128,30 @@ function validEntity(entity, idField, prefix, statuses) {
     typeof entity[idField] === "string" && entity[idField].startsWith(prefix) && statuses.includes(entity.status);
 }
 
-async function defaultMetadataClient(config, deployDir) {
+function validUser(entity, userId) {
+  return entity !== null && typeof entity === "object" && !Array.isArray(entity) &&
+    typeof entity.user_id === "string" && entity.user_id.startsWith("usr-") && entity.user_id === userId;
+}
+
+async function deploymentAdminKey(deployDir) {
   const key = (await readFile(join(deployDir, ".admin-key"), "utf8")).trim();
   if (!key) throw new Error("missing key");
-  return new MetadataClient({ ...config, userKey: key });
+  return key;
+}
+
+async function defaultMetadataClient(config, deployDir) {
+  const key = await deploymentAdminKey(deployDir);
+  return new MetadataClient({ ...config, userKey: key, timeoutMs: config.timeouts.captureMs });
+}
+
+async function defaultHubClient(config, deployDir) {
+  const key = await deploymentAdminKey(deployDir);
+  return new HubClient({
+    endpoint: config.hubEndpoint,
+    serviceId: config.serviceId,
+    userKey: key,
+    timeoutMs: config.timeouts.recallMs
+  });
 }
 
 async function officialIdentityValid(metadata, identity) {
@@ -139,14 +161,35 @@ async function officialIdentityValid(metadata, identity) {
     metadata.getAgent(identity.agentId),
     metadata.getTask(identity.taskId)
   ]);
-  if (!validEntity(user, "user_id", "usr-", ["active"]) || user.user_id !== identity.userId ||
-    !validEntity(team, "team_id", "team-", ["active"]) || team.team_id !== identity.teamId || team.owner_user_id !== identity.userId ||
-    !validEntity(agent, "agent_id", "agt-", ["active"]) || agent.agent_id !== identity.agentId || agent.team_id !== identity.teamId || agent.owner_user_id !== identity.userId ||
-    !validEntity(task, "task_id", "task-", ["running", "completed"]) || task.task_id !== identity.taskId || task.team_id !== identity.teamId || task.creator_user_id !== identity.userId) {
+  if (!validUser(user, identity.userId) ||
+    !validEntity(team, "team_id", "team-", ["active"]) || team.team_id !== identity.teamId || team.name !== OFFICIAL_IDENTITY_NAMES.team || team.owner_user_id !== identity.userId ||
+    !validEntity(agent, "agent_id", "agt-", ["active"]) || agent.agent_id !== identity.agentId || agent.name !== OFFICIAL_IDENTITY_NAMES.agent || agent.team_id !== identity.teamId || agent.owner_user_id !== identity.userId || agent.visibility !== "team" ||
+    !validEntity(task, "task_id", "task-", ["running", "completed"]) || task.task_id !== identity.taskId || task.title !== OFFICIAL_IDENTITY_NAMES.task || task.team_id !== identity.teamId || task.creator_user_id !== identity.userId) {
     return false;
   }
   const links = await metadata.listTaskAgents({ taskId: identity.taskId });
-  return Array.isArray(links) && links.some((link) => link !== null && typeof link === "object" && link.agent_id === identity.agentId);
+  return Array.isArray(links) && links.some((link) => link !== null && typeof link === "object" &&
+    link.task_id === identity.taskId && link.agent_id === identity.agentId && link.status === "active");
+}
+
+function validHubBlock(block, identity) {
+  return block !== null && typeof block === "object" && !Array.isArray(block) &&
+    block.id === `chat_memory-${identity.teamId}-${identity.agentId}` &&
+    block.agent_id === identity.agentId &&
+    block.title === OFFICIAL_IDENTITY_NAMES.agent &&
+    block.uploaded_by_user_id === identity.userId;
+}
+
+function validHubList(data) {
+  return data !== null && typeof data === "object" && !Array.isArray(data) &&
+    Array.isArray(data.items) && Number.isInteger(data.total) && data.total >= 0 && data.total === data.items.length;
+}
+
+function validL0Layer(data) {
+  return data !== null && typeof data === "object" && !Array.isArray(data) && data.layer === "L0" &&
+    Array.isArray(data.items) && Number.isInteger(data.total) && data.total >= 0 &&
+    data.limit === 1 && data.offset === 0 && data.items.length <= 1 &&
+    data.total >= data.items.length && ((data.total === 0) === (data.items.length === 0));
 }
 
 export async function runDoctor({
@@ -160,6 +203,8 @@ export async function runDoctor({
   deployDir = resolve(DEFAULT_ROOT_DIR, "..", "..", "deploy", "global-images"),
   metadataClient,
   metadataClientFactory = defaultMetadataClient,
+  hubClient,
+  hubClientFactory = defaultHubClient,
   hookChecker
 } = {}) {
   const checks = [];
@@ -182,7 +227,6 @@ export async function runDoctor({
     checks.push(fail("l0", "无法在配置缺失时检查 L0"));
     checks.push(fail("l1", "无法在配置缺失时检查 L1"));
     checks.push(fail("l3", "无法在配置缺失时检查 L3"));
-    checks.push(fail("write", "无法在配置缺失时检查写入"));
   } else {
     checks.push(await safeCheck(
       "gateway",
@@ -208,28 +252,13 @@ export async function runDoctor({
       "L3 读取可用",
       "L3 读取失败"
     ));
-    if (!write) {
-      checks.push(pass("write", "可选写入测试未启用"));
-    } else {
-      const timestamp = new Date().toISOString();
-      checks.push(await safeCheck(
-        "write",
-        () => gateway.addConversation("doctor-connectivity-check", [
-          { role: "user", content: "cross-agent-memory-doctor", timestamp },
-          { role: "assistant", content: "doctor-ok", timestamp }
-        ]),
-        "可选写入测试成功",
-        "可选写入测试失败"
-      ));
-    }
   }
 
+  let metadata;
+  let identityValid = false;
   if (!config) {
     checks.push(fail("identity", "配置缺失，无法验证正式身份"));
-    checks.push(fail("chat-memory", "配置缺失，无法验证 Hub 资产"));
   } else {
-    let metadata;
-    let identityValid = false;
     try {
       metadata = metadataClient ?? await metadataClientFactory(config, deployDir);
       if (!await officialIdentityValid(metadata, config.identity)) throw new Error("invalid graph");
@@ -238,25 +267,47 @@ export async function runDoctor({
     } catch {
       checks.push(fail("identity", "正式身份不存在、归属不一致或状态无效"));
     }
-    if (!identityValid) {
-      checks.push(fail("chat-memory", "正式身份无效，无法验证 Hub chat_memory 资产"));
-    } else try {
-      metadata ??= metadataClient ?? await metadataClientFactory(config, deployDir);
-      const assets = await metadata.listChatMemoryAssets({ teamId: config.identity.teamId, agentId: config.identity.agentId });
-      if (!Array.isArray(assets)) throw new Error("invalid assets");
-      if (assets.length === 0) checks.push(wait("chat-memory", "尚未首写；等待 chat_memory 资产生成"));
-      else {
-        const expectedAsset = assets.filter((asset) => asset !== null && typeof asset === "object" &&
-          asset.asset_id === `chat_memory-${config.identity.teamId}-${config.identity.agentId}`);
-        if (expectedAsset.length !== 1 || expectedAsset[0].asset_type !== "chat_memory" ||
-          expectedAsset[0].team_id !== config.identity.teamId || expectedAsset[0].owner_user_id !== config.identity.userId ||
-          expectedAsset[0].status !== "active") {
-        checks.push(fail("chat-memory", "Hub chat_memory 资产不可见或无效"));
-        } else checks.push(pass("chat-memory", "Hub chat_memory 资产可见"));
-      }
-    } catch {
-      checks.push(fail("chat-memory", "无法验证 Hub chat_memory 资产"));
+  }
+
+  if (!config || !gateway) {
+    checks.push(fail("write", "无法在配置缺失时检查写入"));
+  } else if (!write) {
+    checks.push(pass("write", "可选写入测试未启用"));
+  } else if (!identityValid) {
+    checks.push(fail("write", "正式身份无效，未执行可选写入测试"));
+  } else {
+    const timestamp = new Date().toISOString();
+    checks.push(await safeCheck(
+      "write",
+      () => gateway.addConversation("doctor-connectivity-check", [
+        { role: "user", content: "cross-agent-memory-doctor", timestamp },
+        { role: "assistant", content: "doctor-ok", timestamp }
+      ]),
+      "可选写入测试成功",
+      "可选写入测试失败"
+    ));
+  }
+
+  if (!config) {
+    checks.push(fail("chat-memory", "配置缺失，无法验证 Hub chat_memory"));
+  } else if (!identityValid) {
+    checks.push(fail("chat-memory", "正式身份无效，无法验证 Hub chat_memory"));
+  } else try {
+    const hub = hubClient ?? await hubClientFactory(config, deployDir);
+    const blocks = await hub.listMyAgents({ teamId: config.identity.teamId });
+    if (!validHubList(blocks)) throw new Error("invalid Hub list");
+    const expected = blocks.items.filter((block) => validHubBlock(block, config.identity));
+    if (expected.length !== 1) throw new Error("missing official Hub block");
+    const blockId = `chat_memory-${config.identity.teamId}-${config.identity.agentId}`;
+    const layer = await hub.readLayer({ blockId, layer: "L0", limit: 1, offset: 0 });
+    if (!validL0Layer(layer)) throw new Error("invalid Hub layer");
+    if (layer.total === 0) {
+      checks.push(wait("chat-memory", "Hub 可连接且正式记忆块可见；尚未首写 L0"));
+    } else {
+      checks.push(pass("chat-memory", `Hub 正式记忆块可见，L0 共 ${layer.total} 条`));
     }
+  } catch {
+    checks.push(fail("chat-memory", "Memory Hub 不可连接、正式记忆块无效或 L0 无法读取"));
   }
 
   for (const client of ["codex", "claude", "zcode"]) {

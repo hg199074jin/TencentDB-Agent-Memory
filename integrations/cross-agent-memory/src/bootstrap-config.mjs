@@ -55,6 +55,17 @@ function parseLocalPort(source) {
   return port;
 }
 
+function parsePanelPort(source) {
+  if (source === null) return 8125;
+  const match = source.match(/^\s*PANEL_PORT\s*=\s*([^\s#]+)\s*(?:#.*)?$/m);
+  if (!match) return 8125;
+  const port = Number(match[1].replace(/^['"]|['"]$/g, ""));
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new BootstrapError("invalid-panel-port", "Invalid local deployment PANEL_PORT");
+  }
+  return port;
+}
+
 function parseGatewayCredential(source) {
   let assignment;
   for (const line of source.split(/\r?\n/)) {
@@ -88,9 +99,10 @@ function parseGatewayCredential(source) {
     : { apiKey: value, credentialMode: "gateway-bearer" };
 }
 
-function makeConfig({ endpoint, apiKey }) {
+function makeConfig({ endpoint, hubEndpoint, apiKey }) {
   return {
     endpoint,
+    hubEndpoint,
     apiKey,
     serviceId: "default",
     identity: {},
@@ -112,17 +124,27 @@ function validEntity(entity, idField, prefix, statuses) {
   return entity;
 }
 
+function validVerifiedUser(entity) {
+  if (entity === null || typeof entity !== "object" || Array.isArray(entity) ||
+    typeof entity.user_id !== "string" || !entity.user_id.startsWith("usr-")) {
+    throw metadataFailure();
+  }
+  return entity;
+}
+
 function exactOne(items, nameField, name) {
   if (!Array.isArray(items)) throw metadataFailure();
-  const exact = items.filter((item) => item !== null && typeof item === "object" && item[nameField] === name);
-  if (exact.length > 1) throw metadataFailure("Metadata exact-name conflict");
-  return exact[0] ?? null;
+  if (!items.every((item) => item !== null && typeof item === "object" && !Array.isArray(item) && item[nameField] === name)) {
+    throw metadataFailure("Metadata exact-name response mismatch");
+  }
+  if (items.length > 1) throw metadataFailure("Metadata exact-name conflict");
+  return items[0] ?? null;
 }
 
 async function resolveOfficialIdentity(metadata) {
   let user;
   try {
-    user = validEntity(await metadata.verifyCurrentUser(), "user_id", "usr-", ["active"]);
+    user = validVerifiedUser(await metadata.verifyCurrentUser());
   } catch (error) {
     if (error instanceof BootstrapError) throw error;
     throw metadataFailure();
@@ -160,13 +182,13 @@ async function resolveOfficialIdentity(metadata) {
   const teamId = team.team_id;
   const agent = await oneOrCreate({
     list: () => metadata.listAgents({ teamId, name: OFFICIAL_IDENTITY_NAMES.agent }),
-    create: () => metadata.createAgent({ teamId, ownerUserId: userId, name: OFFICIAL_IDENTITY_NAMES.agent }),
+    create: () => metadata.createAgent({ teamId, ownerUserId: userId, name: OFFICIAL_IDENTITY_NAMES.agent, visibility: "team" }),
     nameField: "name",
     name: OFFICIAL_IDENTITY_NAMES.agent,
     idField: "agent_id",
     prefix: "agt-",
     statuses: ["active"],
-    valid: (item) => item.team_id === teamId && item.owner_user_id === userId
+    valid: (item) => item.team_id === teamId && item.owner_user_id === userId && item.visibility === "team"
   });
   const agentId = agent.agent_id;
   const task = await oneOrCreate({
@@ -185,7 +207,8 @@ async function resolveOfficialIdentity(metadata) {
   } catch {
     throw metadataFailure();
   }
-  if (!Array.isArray(links) || !links.some((link) => link !== null && typeof link === "object" && link.agent_id === agentId)) {
+  if (!Array.isArray(links) || !links.some((link) => link !== null && typeof link === "object" &&
+    link.task_id === task.task_id && link.agent_id === agentId && link.status === "active")) {
     throw metadataFailure("Metadata relationship mismatch");
   }
   return { userId, teamId, agentId, taskId: task.task_id };
@@ -257,7 +280,12 @@ export async function bootstrapConfig({
   const envText = envSource.toString("utf8");
   const { apiKey, credentialMode } = parseGatewayCredential(envText);
   const port = parseLocalPort(envText);
-  const config = makeConfig({ endpoint: `http://127.0.0.1:${port}`, apiKey });
+  const panelPort = parsePanelPort(envText);
+  const config = makeConfig({
+    endpoint: `http://127.0.0.1:${port}`,
+    hubEndpoint: `http://127.0.0.1:${panelPort}`,
+    apiKey
+  });
   const adminKeySource = await readOptional(join(resolve(deployDir), ".admin-key"));
   const adminKey = adminKeySource?.toString("utf8").trim();
   if (!adminKey) throw new BootstrapError("missing-admin-key", "Missing deployment administrator key");
@@ -330,6 +358,7 @@ function bootstrapFailureMessage(error) {
     "missing-gateway-key": "[FAIL] 配置未写入：.env 必须显式设置 MEMORY_CORE_GATEWAY_API_KEY（非空 Bearer，或留空关闭 Bearer gate）。",
     "invalid-gateway-key": "[FAIL] 配置未写入：MEMORY_CORE_GATEWAY_API_KEY 声明无效。",
     "invalid-port": "[FAIL] 配置未写入：本地 Gateway 端口配置无效。",
+    "invalid-panel-port": "[FAIL] 配置未写入：本地 Memory Hub Panel 端口配置无效。",
     gateway: "[FAIL] 配置未写入：MemoryCore/Gateway 不可用或拒绝正式身份。",
     metadata: "[FAIL] 配置未写入：Memory Hub 元数据身份验证失败。",
     "missing-admin-key": "[FAIL] 配置未写入：缺少部署管理员密钥文件。",

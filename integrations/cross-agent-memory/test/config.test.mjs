@@ -7,6 +7,7 @@ import { loadConfig } from "../src/config.mjs";
 
 const completeConfig = {
   endpoint: "http://127.0.0.1:8420/",
+  hubEndpoint: "http://127.0.0.1:8125/",
   apiKey: "local-test-key",
   serviceId: "default",
   identity: {
@@ -81,11 +82,29 @@ test("loadConfig normalizes the endpoint and supplies adapter defaults", async (
     const config = await loadConfig(dir);
 
     assert.equal(config.endpoint, "http://127.0.0.1:8420");
+    assert.equal(config.hubEndpoint, "http://127.0.0.1:8125");
     assert.equal(config.timeouts.recallMs, 1200);
     assert.equal(config.timeouts.captureMs, 3000);
     assert.equal(config.queue.retryBatchSize, 3);
     assert.equal(Object.isFrozen(config), true);
     assert.equal(Object.isFrozen(config.identity), true);
+  });
+});
+
+test("loadConfig keeps existing Hook configs compatible by defaulting a missing Hub endpoint", async () => {
+  const legacy = structuredClone(completeConfig);
+  delete legacy.hubEndpoint;
+  await withConfig(legacy, async (dir) => {
+    const config = await loadConfig(dir);
+    assert.equal(config.hubEndpoint, "http://127.0.0.1:8125");
+  });
+});
+
+test("loadConfig rejects an unsafe Hub endpoint", async () => {
+  const config = structuredClone(completeConfig);
+  config.hubEndpoint = "file:///tmp/panel";
+  await withConfig(config, async (dir) => {
+    await assert.rejects(loadConfig(dir), /hubEndpoint|HTTP\(S\)/i);
   });
 });
 
@@ -96,6 +115,7 @@ test("config example remains valid as a user-copyable starting point", async () 
   await withConfig(example, async (dir) => {
     const config = await loadConfig(dir);
     assert.equal(config.endpoint, "http://127.0.0.1:8420");
-    assert.equal(config.identity.taskId, "task-cross-agent-chat");
+    assert.equal(config.hubEndpoint, "http://127.0.0.1:8125");
+    assert.equal(config.identity.taskId, "task-generated-example");
   });
 });

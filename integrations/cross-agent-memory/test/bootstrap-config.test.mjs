@@ -54,17 +54,18 @@ async function runCli({ adapterRoot, deployDir }) {
 
 async function withMetadataGateway(run) {
   const envelope = (data) => JSON.stringify({ code: 0, message: "ok", request_id: "request-1", data });
+  const page = (items = []) => ({ items, total: items.length, limit: 100, offset: 0 });
   const server = createServer((request, response) => {
     response.setHeader("Content-Type", "application/json");
     const routes = {
-      "/v3/meta/auth/verify": { valid: true, user: { user_id: "usr-owner", status: "active" } },
-      "/v3/meta/team/list": { items: [] },
+      "/v3/meta/auth/verify": { valid: true, user: { user_id: "usr-owner", user_type: "system_admin", username: "admin", created_at: "2026-08-10T00:00:00.000Z" } },
+      "/v3/meta/team/list": page(),
       "/v3/meta/team/create": { team_id: "team-1", name: "个人跨 Agent 记忆", owner_user_id: "usr-owner", status: "active" },
-      "/v3/meta/agent/list": { items: [] },
-      "/v3/meta/agent/create": { agent_id: "agt-1", name: "共享个人助手", team_id: "team-1", owner_user_id: "usr-owner", status: "active" },
-      "/v3/meta/task/list": { items: [] },
+      "/v3/meta/agent/list": page(),
+      "/v3/meta/agent/create": { agent_id: "agt-1", name: "共享个人助手", team_id: "team-1", owner_user_id: "usr-owner", visibility: "team", status: "active" },
+      "/v3/meta/task/list": page(),
       "/v3/meta/task/create": { task_id: "task-1", title: "日常共享对话", team_id: "team-1", creator_user_id: "usr-owner", status: "running" },
-      "/v3/meta/task-agent/list": { items: [{ task_id: "task-1", agent_id: "agt-1" }] },
+      "/v3/meta/task-agent/list": page([{ task_id: "task-1", agent_id: "agt-1", status: "active" }]),
       "/v3/core/read": {}
     };
     if (!Object.hasOwn(routes, request.url)) {
@@ -92,6 +93,7 @@ class MetadataFixture {
     this.tasks = [];
     this.links = [];
     this.assets = [];
+    this.agentCreateInputs = [];
     this.next = 1;
   }
 
@@ -105,8 +107,9 @@ class MetadataFixture {
   async listAgents({ teamId, name }) {
     return this.agents.filter((item) => item.team_id === teamId && item.name === name);
   }
-  async createAgent({ teamId, ownerUserId, name }) {
-    const agent = { agent_id: `agt-${this.next++}`, team_id: teamId, owner_user_id: ownerUserId, name, status: "active" };
+  async createAgent({ teamId, ownerUserId, name, visibility }) {
+    this.agentCreateInputs.push({ teamId, ownerUserId, name, visibility });
+    const agent = { agent_id: `agt-${this.next++}`, team_id: teamId, owner_user_id: ownerUserId, name, visibility, status: "active" };
     this.agents.push(agent);
     return agent;
   }
@@ -116,14 +119,14 @@ class MetadataFixture {
   async createTask({ teamId, creatorUserId, title, agentId }) {
     const task = { task_id: `task-${this.next++}`, team_id: teamId, creator_user_id: creatorUserId, title, status: "running" };
     this.tasks.push(task);
-    this.links.push({ task_id: task.task_id, agent_id: agentId });
+    this.links.push({ task_id: task.task_id, agent_id: agentId, status: "active" });
     return task;
   }
   async listTaskAgents({ taskId }) { return this.links.filter((item) => item.task_id === taskId); }
 }
 
 async function setupDeployment(deployDir) {
-  await writeText(join(deployDir, ".env"), "MEMORY_CORE_GATEWAY_API_KEY=gateway-test-token\n");
+  await writeText(join(deployDir, ".env"), "MEMORY_CORE_GATEWAY_API_KEY=gateway-test-token\nPANEL_PORT=18125\n");
   await writeText(join(deployDir, ".admin-key"), "admin-user-key-only-for-metadata\n");
 }
 
@@ -147,11 +150,25 @@ test("bootstrap creates the official metadata graph and writes only generated ID
       taskId: "task-3"
     });
     assert.equal(config.apiKey, "gateway-test-token");
+    assert.equal(config.hubEndpoint, "http://127.0.0.1:18125");
     assert.equal(JSON.stringify(config).includes("admin-user-key-only-for-metadata"), false);
     assert.equal(metadata.teams[0].name, "个人跨 Agent 记忆");
     assert.equal(metadata.agents[0].name, "共享个人助手");
+    assert.equal(metadata.agents[0].visibility, "team");
+    assert.equal(metadata.agentCreateInputs[0].visibility, "team");
     assert.equal(metadata.tasks[0].title, "日常共享对话");
-    assert.deepEqual(metadata.links, [{ task_id: "task-3", agent_id: "agt-2" }]);
+    assert.deepEqual(metadata.links, [{ task_id: "task-3", agent_id: "agt-2", status: "active" }]);
+  });
+});
+
+test("bootstrap accepts the real public user projection without a status field", async () => {
+  await withSandbox(async ({ adapterRoot, deployDir }) => {
+    await setupDeployment(deployDir);
+    const metadata = new MetadataFixture({
+      user: { user_id: "usr-owner", user_type: "system_admin", username: "admin", created_at: "2026-08-10T00:00:00.000Z" }
+    });
+    const result = await bootstrapConfig({ adapterRoot, deployDir, metadataClient: metadata, gatewayFactory });
+    assert.equal(result.identity.userId, "usr-owner");
   });
 });
 
@@ -173,7 +190,7 @@ test("bootstrap reuses one exact graph and completes a retry after partial creat
     await setupDeployment(deployDir);
     const metadata = new MetadataFixture();
     const team = await metadata.createTeam({ name: OFFICIAL_IDENTITY_NAMES.team, ownerUserId: "usr-owner" });
-    const agent = await metadata.createAgent({ teamId: team.team_id, ownerUserId: "usr-owner", name: OFFICIAL_IDENTITY_NAMES.agent });
+    const agent = await metadata.createAgent({ teamId: team.team_id, ownerUserId: "usr-owner", name: OFFICIAL_IDENTITY_NAMES.agent, visibility: "team" });
     let firstTaskCreate = true;
     const createTask = metadata.createTask.bind(metadata);
     metadata.createTask = async (input) => {
@@ -199,6 +216,43 @@ test("bootstrap reuses one exact graph and completes a retry after partial creat
   });
 });
 
+test("bootstrap refuses a private same-name agent and a renamed filtered entity without creating duplicates", async () => {
+  await withSandbox(async ({ adapterRoot, deployDir }) => {
+    await setupDeployment(deployDir);
+    const metadata = new MetadataFixture();
+    const team = await metadata.createTeam({ name: OFFICIAL_IDENTITY_NAMES.team, ownerUserId: "usr-owner" });
+    metadata.agents.push({
+      agent_id: "agt-private",
+      team_id: team.team_id,
+      owner_user_id: "usr-owner",
+      name: OFFICIAL_IDENTITY_NAMES.agent,
+      visibility: "private",
+      status: "active"
+    });
+    await assert.rejects(
+      bootstrapConfig({ adapterRoot, deployDir, metadataClient: metadata, gatewayFactory }),
+      /relationship|metadata/i
+    );
+    assert.equal(metadata.agents.length, 1);
+  });
+
+  await withSandbox(async ({ adapterRoot, deployDir }) => {
+    await setupDeployment(deployDir);
+    const metadata = new MetadataFixture();
+    metadata.listTeams = async () => [{
+      team_id: "team-renamed",
+      name: "已改名团队",
+      owner_user_id: "usr-owner",
+      status: "active"
+    }];
+    await assert.rejects(
+      bootstrapConfig({ adapterRoot, deployDir, metadataClient: metadata, gatewayFactory }),
+      /metadata/i
+    );
+    assert.equal(metadata.teams.length, 0);
+  });
+});
+
 test("bootstrap stops on exact-name conflicts, malformed metadata, or invalid relationships without replacing config", async () => {
   await withSandbox(async ({ adapterRoot, deployDir }) => {
     await setupDeployment(deployDir);
@@ -216,7 +270,7 @@ test("bootstrap stops on exact-name conflicts, malformed metadata, or invalid re
     assert.deepEqual(await readFile(join(adapterRoot, "config.local.json")), original);
 
     const malformed = new MetadataFixture();
-    malformed.verifyCurrentUser = async () => ({ user_id: "usr-owner" });
+    malformed.verifyCurrentUser = async () => ({ user_id: "not-official" });
     await assert.rejects(
       bootstrapConfig({ adapterRoot, deployDir, force: true, metadataClient: malformed, gatewayFactory }),
       /metadata/i
@@ -233,7 +287,7 @@ test("bootstrap stops on exact-name conflicts, malformed metadata, or invalid re
 
     const mismatch = new MetadataFixture();
     const wrongTeam = await mismatch.createTeam({ name: OFFICIAL_IDENTITY_NAMES.team, ownerUserId: "usr-other" });
-    await mismatch.createAgent({ teamId: wrongTeam.team_id, ownerUserId: "usr-owner", name: OFFICIAL_IDENTITY_NAMES.agent });
+    await mismatch.createAgent({ teamId: wrongTeam.team_id, ownerUserId: "usr-owner", name: OFFICIAL_IDENTITY_NAMES.agent, visibility: "team" });
     await assert.rejects(
       bootstrapConfig({ adapterRoot, deployDir, force: true, metadataClient: mismatch, gatewayFactory }),
       /relationship|metadata/i
@@ -382,6 +436,18 @@ test("missing or malformed deployment Gateway configuration leaves no config", a
   });
 });
 
+test("bootstrap rejects an invalid deployment Panel port instead of writing an unusable Hub endpoint", async () => {
+  await withSandbox(async ({ adapterRoot, deployDir }) => {
+    await writeText(join(deployDir, ".env"), "MEMORY_CORE_GATEWAY_API_KEY=gateway-test-token\nPANEL_PORT=not-a-port\n");
+    await writeText(join(deployDir, ".admin-key"), "admin-test-key\n");
+    await assert.rejects(
+      bootstrapConfig({ adapterRoot, deployDir, metadataClient: new MetadataFixture(), gatewayFactory }),
+      /Panel|PANEL_PORT|port/i
+    );
+    await assert.rejects(readFile(join(adapterRoot, "config.local.json"), "utf8"), { code: "ENOENT" });
+  });
+});
+
 test("Gateway rejection does not write a verified metadata identity", async () => {
   await withSandbox(async ({ adapterRoot, deployDir }) => {
     await setupDeployment(deployDir);
@@ -415,6 +481,7 @@ test("bootstrap CLI preserves exact existing-config, missing-env, and invalid-po
 
 test("bootstrap CLI reports an exact sanitized Gateway rejection after real metadata calls", async () => {
   const envelope = (data) => JSON.stringify({ code: 0, message: "ok", request_id: "request-1", data });
+  const page = (items = []) => ({ items, total: items.length, limit: 100, offset: 0 });
   const server = createServer((request, response) => {
     response.setHeader("Content-Type", "application/json");
     if (request.url === "/v3/core/read") {
@@ -423,14 +490,14 @@ test("bootstrap CLI reports an exact sanitized Gateway rejection after real meta
       return;
     }
     const routes = {
-      "/v3/meta/auth/verify": { valid: true, user: { user_id: "usr-owner", status: "active" } },
-      "/v3/meta/team/list": { items: [] },
+      "/v3/meta/auth/verify": { valid: true, user: { user_id: "usr-owner", user_type: "system_admin", username: "admin", created_at: "2026-08-10T00:00:00.000Z" } },
+      "/v3/meta/team/list": page(),
       "/v3/meta/team/create": { team_id: "team-1", name: "个人跨 Agent 记忆", owner_user_id: "usr-owner", status: "active" },
-      "/v3/meta/agent/list": { items: [] },
-      "/v3/meta/agent/create": { agent_id: "agt-1", name: "共享个人助手", team_id: "team-1", owner_user_id: "usr-owner", status: "active" },
-      "/v3/meta/task/list": { items: [] },
+      "/v3/meta/agent/list": page(),
+      "/v3/meta/agent/create": { agent_id: "agt-1", name: "共享个人助手", team_id: "team-1", owner_user_id: "usr-owner", visibility: "team", status: "active" },
+      "/v3/meta/task/list": page(),
       "/v3/meta/task/create": { task_id: "task-1", title: "日常共享对话", team_id: "team-1", creator_user_id: "usr-owner", status: "running" },
-      "/v3/meta/task-agent/list": { items: [{ task_id: "task-1", agent_id: "agt-1" }] }
+      "/v3/meta/task-agent/list": page([{ task_id: "task-1", agent_id: "agt-1", status: "active" }])
     };
     response.end(envelope(routes[request.url]));
   });

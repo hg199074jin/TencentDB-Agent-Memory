@@ -1,3 +1,6 @@
+const MAX_LIST_LIMIT = 100;
+const DEFAULT_TIMEOUT_MS = 3000;
+
 function requiredString(value, field) {
   if (typeof value !== "string" || value.trim() === "") {
     throw new Error(`Invalid metadata client configuration: ${field}`);
@@ -5,19 +8,42 @@ function requiredString(value, field) {
   return value.trim();
 }
 
-function listItems(data) {
-  if (data === null || typeof data !== "object" || Array.isArray(data) || !Array.isArray(data.items)) {
+function positiveInteger(value, field, defaultValue) {
+  const resolved = value === undefined ? defaultValue : value;
+  if (!Number.isInteger(resolved) || resolved <= 0) {
+    throw new Error(`Invalid metadata client configuration: ${field}`);
+  }
+  return resolved;
+}
+
+function validListPage(data, { limit, offset, total }) {
+  if (
+    data === null || typeof data !== "object" || Array.isArray(data) ||
+    !Array.isArray(data.items) ||
+    !Number.isInteger(data.total) || data.total < 0 ||
+    !Number.isInteger(data.limit) || data.limit !== limit ||
+    !Number.isInteger(data.offset) || data.offset !== offset ||
+    data.items.length > limit ||
+    data.total < offset + data.items.length ||
+    (total !== null && data.total !== total)
+  ) {
     throw new Error("Invalid Metadata API list response");
   }
-  return data.items;
+
+  const nextOffset = offset + data.items.length;
+  if (nextOffset < data.total && (data.items.length === 0 || data.items.length < limit)) {
+    throw new Error("Invalid Metadata API list response");
+  }
+  return data;
 }
 
 export class MetadataClient {
-  constructor({ endpoint, apiKey, serviceId, userKey }) {
+  constructor({ endpoint, apiKey, serviceId, userKey, timeoutMs = DEFAULT_TIMEOUT_MS }) {
     this.endpoint = requiredString(endpoint, "endpoint").replace(/\/+$/, "");
     this.apiKey = requiredString(apiKey, "apiKey");
     this.serviceId = requiredString(serviceId, "serviceId");
     this.userKey = requiredString(userKey, "userKey");
+    this.timeoutMs = positiveInteger(timeoutMs, "timeoutMs", DEFAULT_TIMEOUT_MS);
   }
 
   async verifyCurrentUser() {
@@ -29,7 +55,7 @@ export class MetadataClient {
   }
 
   async listTeams({ userId, name }) {
-    return listItems(await this.#post("/v3/meta/team/list", { user_id: userId, name, limit: 100 }));
+    return this.#listAll("/v3/meta/team/list", { user_id: userId, name });
   }
 
   async createTeam({ name, ownerUserId }) {
@@ -37,19 +63,20 @@ export class MetadataClient {
   }
 
   async listAgents({ teamId, name }) {
-    return listItems(await this.#post("/v3/meta/agent/list", { team_id: teamId, name, limit: 100 }));
+    return this.#listAll("/v3/meta/agent/list", { team_id: teamId, name });
   }
 
-  async createAgent({ teamId, ownerUserId, name }) {
+  async createAgent({ teamId, ownerUserId, name, visibility = "team" }) {
     return this.#post("/v3/meta/agent/create", {
       team_id: teamId,
       owner_user_id: ownerUserId,
-      name
+      name,
+      visibility
     });
   }
 
   async listTasks({ teamId, title }) {
-    return listItems(await this.#post("/v3/meta/task/list", { team_id: teamId, title, limit: 100 }));
+    return this.#listAll("/v3/meta/task/list", { team_id: teamId, title });
   }
 
   async createTask({ teamId, creatorUserId, title, agentId }) {
@@ -62,20 +89,36 @@ export class MetadataClient {
   }
 
   async listTaskAgents({ taskId }) {
-    return listItems(await this.#post("/v3/meta/task-agent/list", { task_id: taskId, limit: 100 }));
+    return this.#listAll("/v3/meta/task-agent/list", { task_id: taskId });
   }
 
   async getUser(userId) { return this.#post("/v3/meta/user/get", { user_id: userId }); }
   async getTeam(teamId) { return this.#post("/v3/meta/team/get", { team_id: teamId }); }
   async getAgent(agentId) { return this.#post("/v3/meta/agent/get", { agent_id: agentId }); }
   async getTask(taskId) { return this.#post("/v3/meta/task/get", { task_id: taskId }); }
+  async getAsset(assetId) { return this.#post("/v3/meta/asset/get", { asset_id: assetId }); }
 
   async listChatMemoryAssets({ teamId }) {
-    return listItems(await this.#post("/v3/meta/asset/list", {
+    return this.#listAll("/v3/meta/asset/list", {
       team_id: teamId,
-      asset_type: "chat_memory",
-      limit: 100
-    }));
+      asset_type: "chat_memory"
+    });
+  }
+
+  async #listAll(path, body) {
+    const items = [];
+    let offset = 0;
+    let total = null;
+    for (;;) {
+      const page = validListPage(
+        await this.#post(path, { ...body, limit: MAX_LIST_LIMIT, offset }),
+        { limit: MAX_LIST_LIMIT, offset, total }
+      );
+      total ??= page.total;
+      items.push(...page.items);
+      if (items.length === total) return items;
+      offset += page.items.length;
+    }
   }
 
   async #post(path, body) {
@@ -83,6 +126,7 @@ export class MetadataClient {
     try {
       response = await fetch(`${this.endpoint}${path}`, {
         method: "POST",
+        signal: AbortSignal.timeout(this.timeoutMs),
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
           "x-tdai-service-id": this.serviceId,

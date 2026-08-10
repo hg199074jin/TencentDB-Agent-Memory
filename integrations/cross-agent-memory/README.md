@@ -54,7 +54,6 @@ MEMORY_CORE_GATEWAY_API_KEY=<Gateway Bearer>
 ```powershell
 Set-Location D:\TencentDB-Agent-Memory\integrations\cross-agent-memory
 node src/bootstrap-config.mjs
-node src/doctor.mjs
 node src/install-hooks.mjs install
 node src/doctor.mjs
 ```
@@ -62,9 +61,8 @@ node src/doctor.mjs
 各步骤的作用：
 
 1. `bootstrap-config` 从现有本地部署读取 Gateway 地址和认证材料，创建或复用固定的正式 Metadata 身份，随后才写入配置。
-2. 第一次 `doctor` 检查 Node、配置、Gateway 以及 L0/L1/L3。
-3. `install-hooks` 只给三个客户端增加两项记忆 Hook，并把原配置备份到 D 盘。
-4. 第二次 `doctor` 再确认三个客户端都注册成功。
+2. `install-hooks` 只给三个客户端增加两项记忆 Hook，并把原配置备份到 D 盘。
+3. `doctor` 一次检查 Node、配置、Gateway、L0/L1/L3、正式身份、Memory Hub L0 以及三个客户端的 Hook。首次还没有写入对话时，`chat-memory` 显示 `WAIT` 属于成功完成诊断，不会阻止后续首次会话验收。
 
 如果 `config.local.json` 已存在，引导程序默认不会覆盖。确实需要重建时使用：
 
@@ -272,7 +270,14 @@ node src/doctor.mjs
 
 这套回归把半年内最容易变化的地方集中在 MemoryCore API、Hook 输入输出和三端配置格式。测试和诊断通过后，才重新安装或继续真实验收。
 
-自动化测试为了避免接触真实配置，只在同时设置 `CROSS_AGENT_MEMORY_TEST_MODE=1` 时读取 `CROSS_AGENT_MEMORY_TEST_ADAPTER_ROOT` 和 `CROSS_AGENT_MEMORY_TEST_DEPLOY_DIR` 两个临时路径变量。它们只用于测试隔离、不承载凭据，日常使用不要设置。
+自动化测试为了避免接触真实配置，只在同时设置 `CROSS_AGENT_MEMORY_TEST_MODE=1` 时读取以下临时路径变量：
+
+- `CROSS_AGENT_MEMORY_TEST_ADAPTER_ROOT`
+- `CROSS_AGENT_MEMORY_TEST_DEPLOY_DIR`
+- `CROSS_AGENT_MEMORY_TEST_USERPROFILE`
+- `CROSS_AGENT_MEMORY_TEST_RUNTIME_DIR`
+
+这些变量只用于测试隔离、不承载凭据。日常使用不要设置 `CROSS_AGENT_MEMORY_TEST_MODE`，也不要把上述测试路径变量长期留在用户或系统环境中。
 
 ## 本机验证记录
 

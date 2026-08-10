@@ -31,7 +31,7 @@ function optionalObject(value, field) {
   return value;
 }
 
-function normalizeEndpoint(endpoint) {
+function normalizeEndpoint(endpoint, field = "endpoint") {
   const normalized = endpoint.replace(/\/+$/, "");
   try {
     const url = new URL(normalized);
@@ -39,7 +39,7 @@ function normalizeEndpoint(endpoint) {
       throw new Error("unsupported protocol");
     }
   } catch {
-    throw new Error("Invalid config: endpoint must be an HTTP(S) URL");
+    throw new Error(`Invalid config: ${field} must be an HTTP(S) URL`);
   }
   return normalized;
 }
@@ -80,6 +80,12 @@ export async function loadConfig(rootDir = DEFAULT_ROOT_DIR) {
 
   const normalizedConfig = {
     endpoint: normalizeEndpoint(requiredString(config.endpoint, "endpoint")),
+    hubEndpoint: normalizeEndpoint(
+      config.hubEndpoint === undefined
+        ? "http://127.0.0.1:8125"
+        : requiredString(config.hubEndpoint, "hubEndpoint"),
+      "hubEndpoint"
+    ),
     apiKey: requiredString(config.apiKey, "apiKey"),
     serviceId: requiredString(config.serviceId, "serviceId"),
     identity: {
