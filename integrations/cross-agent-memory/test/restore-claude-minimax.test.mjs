@@ -5,11 +5,12 @@ import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { restoreClaudeMiniMax } from "../src/restore-claude-minimax.mjs";
+import { cliRestoreOptions, restoreClaudeMiniMax } from "../src/restore-claude-minimax.mjs";
 
 const execFileAsync = promisify(execFile);
-const CLI_PATH = resolve("src/restore-claude-minimax.mjs");
+const CLI_PATH = fileURLToPath(new URL("../src/restore-claude-minimax.mjs", import.meta.url));
 
 async function writeJson(path, value) {
   await mkdir(dirname(path), { recursive: true });
@@ -195,19 +196,21 @@ test("restore is idempotent and creates no extra backup after its first successf
   });
 });
 
-test("CLI uses an explicit source path, honors test HOME, returns status, and never exposes the token", async () => {
+test("CLI uses an explicit source path, honors the guarded test profile, returns status, and never exposes the token", async () => {
   await withSandbox(async ({ root, userProfile, runtimeDir }) => {
     const sourcePath = join(root, "trusted-backup.json");
     const targetPath = join(userProfile, ".claude", "settings.json");
+    const productionProfile = join(root, "not-the-test-target");
     const secret = "cli-secret-token";
     await writeJson(sourcePath, sourceConfig({ env: { ANTHROPIC_BASE_URL: "https://api.minimaxi.com/anthropic", ANTHROPIC_AUTH_TOKEN: secret } }));
     await writeJson(targetPath, targetConfig());
 
     const environment = {
       ...process.env,
-      HOME: userProfile,
-      USERPROFILE: userProfile,
+      HOME: productionProfile,
+      USERPROFILE: productionProfile,
       CROSS_AGENT_MEMORY_TEST_MODE: "1",
+      CROSS_AGENT_MEMORY_TEST_USERPROFILE: userProfile,
       CROSS_AGENT_MEMORY_TEST_RUNTIME_DIR: runtimeDir
     };
     const result = await execFileAsync(process.execPath, [CLI_PATH, sourcePath], { env: environment });
@@ -224,5 +227,92 @@ test("CLI uses an explicit source path, honors test HOME, returns status, and ne
       execFileAsync(process.execPath, [CLI_PATH, sourcePath, "unexpected-argument"], { env: environment }),
       (error) => error.code === 1 && `${error.stdout}${error.stderr}`.includes(secret) === false
     );
+  });
+});
+
+test("CLI failure after reading a secret never exposes it and leaves the test target unchanged", async () => {
+  await withSandbox(async ({ root, userProfile, runtimeDir }) => {
+    const sourcePath = join(root, "bad-trusted-backup.json");
+    const targetPath = join(userProfile, ".claude", "settings.json");
+    const secret = "wrong-domain-child-process-secret";
+    const original = Buffer.from(`${JSON.stringify(targetConfig(), null, 2)}\r\n`, "utf8");
+    await writeJson(sourcePath, sourceConfig({ env: {
+      ANTHROPIC_BASE_URL: "https://wrong.example/anthropic",
+      ANTHROPIC_AUTH_TOKEN: secret
+    } }));
+    await mkdir(dirname(targetPath), { recursive: true });
+    await writeFile(targetPath, original);
+
+    const environment = {
+      ...process.env,
+      HOME: join(root, "not-the-test-target"),
+      USERPROFILE: join(root, "not-the-test-target"),
+      CROSS_AGENT_MEMORY_TEST_MODE: "1",
+      CROSS_AGENT_MEMORY_TEST_USERPROFILE: userProfile,
+      CROSS_AGENT_MEMORY_TEST_RUNTIME_DIR: runtimeDir
+    };
+    let failure;
+    try {
+      await execFileAsync(process.execPath, [CLI_PATH, sourcePath], { env: environment });
+    } catch (error) {
+      failure = error;
+    }
+
+    assert.equal(failure?.code, 1);
+    assert.equal(`${failure.stdout}${failure.stderr}`.includes(secret), false);
+    assert.deepEqual(await readFile(targetPath), original);
+  });
+});
+
+test("test-only CLI path overrides require the explicit test-mode guard", async () => {
+  const sourcePath = resolve("trusted-backup.json");
+  const injectedProfile = resolve("test-only-profile");
+  const injectedRuntime = resolve("test-only-runtime");
+
+  assert.deepEqual(
+    cliRestoreOptions(sourcePath, {
+      CROSS_AGENT_MEMORY_TEST_USERPROFILE: injectedProfile,
+      CROSS_AGENT_MEMORY_TEST_RUNTIME_DIR: injectedRuntime
+    }),
+    { sourcePath }
+  );
+  assert.deepEqual(
+    cliRestoreOptions(sourcePath, {
+      CROSS_AGENT_MEMORY_TEST_MODE: "1",
+      CROSS_AGENT_MEMORY_TEST_USERPROFILE: injectedProfile,
+      CROSS_AGENT_MEMORY_TEST_RUNTIME_DIR: injectedRuntime
+    }),
+    { sourcePath, userProfile: injectedProfile, runtimeDir: injectedRuntime }
+  );
+
+  await withSandbox(async ({ root }) => {
+    const sourcePath = join(root, "trusted-backup.json");
+    const productionProfile = join(root, "production-profile");
+    const injectedProfile = join(root, "ignored-test-profile");
+    const targetPath = join(productionProfile, ".claude", "settings.json");
+    const secret = "guarded-profile-secret";
+    await writeJson(sourcePath, sourceConfig({ env: {
+      ANTHROPIC_BASE_URL: "https://api.minimaxi.com/anthropic",
+      ANTHROPIC_AUTH_TOKEN: secret
+    } }));
+    await writeJson(targetPath, targetConfig({ env: {
+      ANTHROPIC_BASE_URL: "https://api.minimaxi.com/anthropic",
+      ANTHROPIC_AUTH_TOKEN: secret,
+      KEEP: "yes"
+    } }));
+    const environment = {
+      ...process.env,
+      HOME: productionProfile,
+      USERPROFILE: productionProfile,
+      CROSS_AGENT_MEMORY_TEST_USERPROFILE: injectedProfile,
+      CROSS_AGENT_MEMORY_TEST_RUNTIME_DIR: join(root, "ignored-test-runtime")
+    };
+    delete environment.CROSS_AGENT_MEMORY_TEST_MODE;
+
+    const result = await execFileAsync(process.execPath, [CLI_PATH, sourcePath], { env: environment });
+    assert.match(result.stdout, /\[UNCHANGED\]/);
+    assert.match(result.stdout, new RegExp(resolve(targetPath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(result.stdout.includes(resolve(injectedProfile)), false);
+    assert.equal(`${result.stdout}${result.stderr}`.includes(secret), false);
   });
 });

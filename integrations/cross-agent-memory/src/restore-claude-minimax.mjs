@@ -158,15 +158,20 @@ function parseArguments(argv) {
   return { sourcePath: argv[0] };
 }
 
+export function cliRestoreOptions(sourcePath, environment = process.env) {
+  if (environment.CROSS_AGENT_MEMORY_TEST_MODE !== "1") return { sourcePath };
+  const userProfile = environment.CROSS_AGENT_MEMORY_TEST_USERPROFILE;
+  const runtimeDir = environment.CROSS_AGENT_MEMORY_TEST_RUNTIME_DIR;
+  return {
+    sourcePath,
+    ...(typeof userProfile === "string" && userProfile !== "" ? { userProfile } : {}),
+    ...(typeof runtimeDir === "string" && runtimeDir !== "" ? { runtimeDir } : {})
+  };
+}
+
 async function main() {
   const { sourcePath } = parseArguments(process.argv.slice(2));
-  const testRuntime = process.env.CROSS_AGENT_MEMORY_TEST_MODE === "1"
-    ? process.env.CROSS_AGENT_MEMORY_TEST_RUNTIME_DIR
-    : undefined;
-  const result = await restoreClaudeMiniMax({
-    sourcePath,
-    ...(testRuntime ? { runtimeDir: testRuntime } : {})
-  });
+  const result = await restoreClaudeMiniMax(cliRestoreOptions(sourcePath));
   process.stdout.write(`${formatRestoreResult(result)}\n`);
 }
 
