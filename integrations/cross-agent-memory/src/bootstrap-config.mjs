@@ -11,16 +11,16 @@ import { randomUUID } from "node:crypto";
 
 import { loadConfig } from "./config.mjs";
 import { GatewayClient } from "./gateway-client.mjs";
+import { MetadataClient } from "./metadata-client.mjs";
 
 const DEFAULT_ADAPTER_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_DEPLOY_DIR = resolve(DEFAULT_ADAPTER_ROOT, "..", "..", "deploy", "global-images");
 const BEARER_DISABLED_FALLBACK = "local-bearer-disabled-compatibility";
 
-export const FIXED_IDENTITY = Object.freeze({
-  teamId: "team-personal-memory",
-  agentId: "agent-personal-assistant",
-  userId: "user-jin-z",
-  taskId: "task-cross-agent-chat"
+export const OFFICIAL_IDENTITY_NAMES = Object.freeze({
+  team: "Cross-Agent Memory",
+  agent: "Cross-Agent Memory Shared Agent",
+  task: "Cross-Agent Memory Shared Task"
 });
 
 class BootstrapError extends Error {
@@ -93,22 +93,106 @@ function makeConfig({ endpoint, apiKey }) {
     endpoint,
     apiKey,
     serviceId: "default",
-    identity: { ...FIXED_IDENTITY },
+    identity: {},
     timeouts: { recallMs: 1200, captureMs: 3000 },
     recall: { l0Limit: 3, l1Limit: 5, maxContextChars: 12000 },
     queue: { retryBatchSize: 3, retryBudgetMs: 800 }
   };
 }
 
-async function verifyFixedIdentity(config, gatewayFactory) {
+function metadataFailure(message = "Metadata identity validation failed") {
+  return new BootstrapError("metadata", message);
+}
+
+function activeEntity(entity, idField) {
+  if (entity === null || typeof entity !== "object" || Array.isArray(entity) ||
+    typeof entity[idField] !== "string" || entity[idField].trim() === "" || entity.status !== "active") {
+    throw metadataFailure();
+  }
+  return entity;
+}
+
+function exactOne(items, nameField, name) {
+  if (!Array.isArray(items)) throw metadataFailure();
+  const exact = items.filter((item) => item !== null && typeof item === "object" && item[nameField] === name);
+  if (exact.length > 1) throw metadataFailure("Metadata exact-name conflict");
+  return exact[0] ?? null;
+}
+
+async function resolveOfficialIdentity(metadata) {
+  let user;
+  try {
+    user = activeEntity(await metadata.verifyCurrentUser(), "user_id");
+  } catch (error) {
+    if (error instanceof BootstrapError) throw error;
+    throw metadataFailure();
+  }
+  const userId = user.user_id;
+
+  async function oneOrCreate({ list, create, nameField, name, idField, valid }) {
+    let found;
+    try {
+      found = exactOne(await list(), nameField, name);
+      if (found !== null) {
+        found = activeEntity(found, idField);
+        if (!valid(found)) throw metadataFailure("Metadata relationship mismatch");
+        return found;
+      }
+      const created = activeEntity(await create(), idField);
+      if (created[nameField] !== name || !valid(created)) throw metadataFailure("Metadata relationship mismatch");
+      return created;
+    } catch (error) {
+      if (error instanceof BootstrapError) throw error;
+      throw metadataFailure();
+    }
+  }
+
+  const team = await oneOrCreate({
+    list: () => metadata.listTeams({ userId, name: OFFICIAL_IDENTITY_NAMES.team }),
+    create: () => metadata.createTeam({ name: OFFICIAL_IDENTITY_NAMES.team, ownerUserId: userId }),
+    nameField: "name",
+    name: OFFICIAL_IDENTITY_NAMES.team,
+    idField: "team_id",
+    valid: (item) => item.owner_user_id === userId
+  });
+  const teamId = team.team_id;
+  const agent = await oneOrCreate({
+    list: () => metadata.listAgents({ teamId, name: OFFICIAL_IDENTITY_NAMES.agent }),
+    create: () => metadata.createAgent({ teamId, ownerUserId: userId, name: OFFICIAL_IDENTITY_NAMES.agent }),
+    nameField: "name",
+    name: OFFICIAL_IDENTITY_NAMES.agent,
+    idField: "agent_id",
+    valid: (item) => item.team_id === teamId && item.owner_user_id === userId
+  });
+  const agentId = agent.agent_id;
+  const task = await oneOrCreate({
+    list: () => metadata.listTasks({ teamId, title: OFFICIAL_IDENTITY_NAMES.task }),
+    create: () => metadata.createTask({ teamId, creatorUserId: userId, title: OFFICIAL_IDENTITY_NAMES.task, agentId }),
+    nameField: "title",
+    name: OFFICIAL_IDENTITY_NAMES.task,
+    idField: "task_id",
+    valid: (item) => item.team_id === teamId && item.creator_user_id === userId
+  });
+  let links;
+  try {
+    links = await metadata.listTaskAgents({ taskId: task.task_id });
+  } catch {
+    throw metadataFailure();
+  }
+  if (!Array.isArray(links) || !links.some((link) => link !== null && typeof link === "object" && link.agent_id === agentId)) {
+    throw metadataFailure("Metadata relationship mismatch");
+  }
+  return { userId, teamId, agentId, taskId: task.task_id };
+}
+
+async function verifyOfficialIdentity(config, gatewayFactory) {
   try {
     const gateway = gatewayFactory(config);
     await gateway.readCore();
   } catch {
     throw new BootstrapError(
       "gateway",
-      "Fixed identity was rejected or the Gateway is unavailable; config was not written. " +
-      "Start MemoryCore and confirm the current standalone Gateway accepts the fixed identity."
+      "Official identity was rejected or the Gateway is unavailable; config was not written."
     );
   }
 }
@@ -137,6 +221,8 @@ export async function bootstrapConfig({
   force = false,
   now = () => new Date(),
   gatewayFactory = (config) => new GatewayClient(config),
+  metadataClient,
+  metadataClientFactory = (config, userKey) => new MetadataClient({ ...config, userKey }),
   renameFile = rename
 } = {}) {
   const root = resolve(adapterRoot);
@@ -166,8 +252,13 @@ export async function bootstrapConfig({
   const { apiKey, credentialMode } = parseGatewayCredential(envText);
   const port = parseLocalPort(envText);
   const config = makeConfig({ endpoint: `http://127.0.0.1:${port}`, apiKey });
+  const adminKeySource = await readOptional(join(resolve(deployDir), ".admin-key"));
+  const adminKey = adminKeySource?.toString("utf8").trim();
+  if (!adminKey) throw new BootstrapError("missing-admin-key", "Missing deployment administrator key");
+  const identity = await resolveOfficialIdentity(metadataClient ?? metadataClientFactory(config, adminKey));
+  config.identity = identity;
 
-  await verifyFixedIdentity(config, gatewayFactory);
+  await verifyOfficialIdentity(config, gatewayFactory);
 
   let backupPath = null;
   if (original !== null) {
@@ -187,7 +278,7 @@ export async function bootstrapConfig({
     status: original === null ? "CREATED" : "REPLACED",
     configPath,
     backupPath,
-    identity: { ...FIXED_IDENTITY },
+    identity: { ...identity },
     credentialMode
   };
 }
@@ -233,7 +324,9 @@ function bootstrapFailureMessage(error) {
     "missing-gateway-key": "[FAIL] 配置未写入：.env 必须显式设置 MEMORY_CORE_GATEWAY_API_KEY（非空 Bearer，或留空关闭 Bearer gate）。",
     "invalid-gateway-key": "[FAIL] 配置未写入：MEMORY_CORE_GATEWAY_API_KEY 声明无效。",
     "invalid-port": "[FAIL] 配置未写入：本地 Gateway 端口配置无效。",
-    gateway: "[FAIL] 配置未写入：MemoryCore/Gateway 不可用或拒绝固定身份。",
+    gateway: "[FAIL] 配置未写入：MemoryCore/Gateway 不可用或拒绝正式身份。",
+    metadata: "[FAIL] 配置未写入：Memory Hub 元数据身份验证失败。",
+    "missing-admin-key": "[FAIL] 配置未写入：缺少部署管理员密钥文件。",
     "replace-failed": "[FAIL] 配置未写入：无法原子替换文件，原配置保持不变。",
     "local-files": "[FAIL] 配置未写入：本地配置文件不可读取。"
   };

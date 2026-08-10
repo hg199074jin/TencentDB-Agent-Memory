@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { loadConfig } from "./config.mjs";
 import { GatewayClient } from "./gateway-client.mjs";
+import { MetadataClient } from "./metadata-client.mjs";
 
 const DEFAULT_ROOT_DIR = fileURLToPath(new URL("../", import.meta.url));
 const DEFAULT_ADAPTER_PATH = fileURLToPath(new URL("./hook-cli.mjs", import.meta.url));
@@ -16,6 +17,10 @@ function pass(name, detail) {
 
 function fail(name, detail) {
   return { name, status: "FAIL", detail };
+}
+
+function wait(name, detail) {
+  return { name, status: "WAIT", detail };
 }
 
 function nodeSupported(version) {
@@ -116,6 +121,34 @@ async function defaultHealthCheck(config) {
   }
 }
 
+function activeEntity(entity, idField) {
+  return entity !== null && typeof entity === "object" && !Array.isArray(entity) &&
+    typeof entity[idField] === "string" && entity[idField].trim() !== "" && entity.status === "active";
+}
+
+async function defaultMetadataClient(config, deployDir) {
+  const key = (await readFile(join(deployDir, ".admin-key"), "utf8")).trim();
+  if (!key) throw new Error("missing key");
+  return new MetadataClient({ ...config, userKey: key });
+}
+
+async function officialIdentityValid(metadata, identity) {
+  const [user, team, agent, task] = await Promise.all([
+    metadata.getUser(identity.userId),
+    metadata.getTeam(identity.teamId),
+    metadata.getAgent(identity.agentId),
+    metadata.getTask(identity.taskId)
+  ]);
+  if (!activeEntity(user, "user_id") || user.user_id !== identity.userId ||
+    !activeEntity(team, "team_id") || team.team_id !== identity.teamId || team.owner_user_id !== identity.userId ||
+    !activeEntity(agent, "agent_id") || agent.agent_id !== identity.agentId || agent.team_id !== identity.teamId || agent.owner_user_id !== identity.userId ||
+    !activeEntity(task, "task_id") || task.task_id !== identity.taskId || task.team_id !== identity.teamId || task.creator_user_id !== identity.userId) {
+    return false;
+  }
+  const links = await metadata.listTaskAgents({ taskId: identity.taskId });
+  return Array.isArray(links) && links.some((link) => link !== null && typeof link === "object" && link.agent_id === identity.agentId);
+}
+
 export async function runDoctor({
   rootDir = DEFAULT_ROOT_DIR,
   userProfile = process.env.USERPROFILE || process.env.HOME || homedir(),
@@ -123,7 +156,11 @@ export async function runDoctor({
   nodeVersion = process.versions.node,
   write = false,
   healthCheck = defaultHealthCheck,
-  gatewayFactory = (config) => new GatewayClient(config)
+  gatewayFactory = (config) => new GatewayClient(config),
+  deployDir = resolve(DEFAULT_ROOT_DIR, "..", "..", "deploy", "global-images"),
+  metadataClient,
+  metadataClientFactory = defaultMetadataClient,
+  hookChecker
 } = {}) {
   const checks = [];
   let config;
@@ -187,11 +224,39 @@ export async function runDoctor({
     }
   }
 
+  if (!config) {
+    checks.push(fail("identity", "配置缺失，无法验证正式身份"));
+    checks.push(fail("chat-memory", "配置缺失，无法验证 Hub 资产"));
+  } else {
+    let metadata;
+    try {
+      metadata = metadataClient ?? await metadataClientFactory(config, deployDir);
+      if (!await officialIdentityValid(metadata, config.identity)) throw new Error("invalid graph");
+      checks.push(pass("identity", "正式身份存在、归属一致且状态有效"));
+    } catch {
+      checks.push(fail("identity", "正式身份不存在、归属不一致或状态无效"));
+    }
+    try {
+      metadata ??= metadataClient ?? await metadataClientFactory(config, deployDir);
+      const assets = await metadata.listChatMemoryAssets({ teamId: config.identity.teamId, agentId: config.identity.agentId });
+      if (!Array.isArray(assets)) throw new Error("invalid assets");
+      if (assets.length === 0) checks.push(wait("chat-memory", "尚未首写；等待 chat_memory 资产生成"));
+      else if (assets.some((asset) => asset === null || typeof asset !== "object" || asset.asset_type !== "chat_memory" || asset.team_id !== config.identity.teamId)) {
+        checks.push(fail("chat-memory", "Hub chat_memory 资产不可见或无效"));
+      } else checks.push(pass("chat-memory", "Hub chat_memory 资产可见"));
+    } catch {
+      checks.push(fail("chat-memory", "无法验证 Hub chat_memory 资产"));
+    }
+  }
+
   for (const client of ["codex", "claude", "zcode"]) {
     checks.push(await safeCheck(
       `hook-${client}`,
       async () => {
-        if (!await hookRegistered({ client, userProfile, adapterPath })) throw new Error("missing");
+        const registered = hookChecker
+          ? await hookChecker(client)
+          : await hookRegistered({ client, userProfile, adapterPath });
+        if (!registered) throw new Error("missing");
       },
       `${client} 的两个 Hook 已注册`,
       `${client} Hook 未完整注册`
