@@ -392,3 +392,66 @@ test("Gateway rejection does not write a verified metadata identity", async () =
     await assert.rejects(readFile(join(adapterRoot, "config.local.json"), "utf8"), { code: "ENOENT" });
   });
 });
+
+test("bootstrap CLI preserves exact existing-config, missing-env, and invalid-port failures", async () => {
+  await withSandbox(async ({ adapterRoot, deployDir }) => {
+    await writeText(join(adapterRoot, "config.local.json"), `${JSON.stringify({ endpoint: "http://127.0.0.1:8420", apiKey: "existing-cli-secret", serviceId: "default", identity: { userId: "usr-owner", teamId: "team-1", agentId: "agt-1", taskId: "task-1" } })}\n`);
+    assert.deepEqual(await runCli({ adapterRoot, deployDir }), {
+      code: 1, stdout: "", stderr: "[FAIL] 配置未写入：config.local.json 已存在；如需替换请使用 --force。\n"
+    });
+  });
+  await withSandbox(async ({ adapterRoot, deployDir }) => {
+    assert.deepEqual(await runCli({ adapterRoot, deployDir }), {
+      code: 1, stdout: "", stderr: "[FAIL] 配置未写入：缺少本地部署配置 deploy/global-images/.env。\n"
+    });
+  });
+  await withSandbox(async ({ adapterRoot, deployDir }) => {
+    await writeText(join(deployDir, ".env"), "MEMORY_CORE_PORT=not-a-port\nMEMORY_CORE_GATEWAY_API_KEY=\n");
+    assert.deepEqual(await runCli({ adapterRoot, deployDir }), {
+      code: 1, stdout: "", stderr: "[FAIL] 配置未写入：本地 Gateway 端口配置无效。\n"
+    });
+  });
+});
+
+test("bootstrap CLI reports an exact sanitized Gateway rejection after real metadata calls", async () => {
+  const envelope = (data) => JSON.stringify({ code: 0, message: "ok", request_id: "request-1", data });
+  const server = createServer((request, response) => {
+    response.setHeader("Content-Type", "application/json");
+    if (request.url === "/v3/core/read") {
+      response.statusCode = 403;
+      response.end("sensitive Gateway rejection body");
+      return;
+    }
+    const routes = {
+      "/v3/meta/auth/verify": { valid: true, user: { user_id: "usr-owner", status: "active" } },
+      "/v3/meta/team/list": { items: [] },
+      "/v3/meta/team/create": { team_id: "team-1", name: "个人跨 Agent 记忆", owner_user_id: "usr-owner", status: "active" },
+      "/v3/meta/agent/list": { items: [] },
+      "/v3/meta/agent/create": { agent_id: "agt-1", name: "共享个人助手", team_id: "team-1", owner_user_id: "usr-owner", status: "active" },
+      "/v3/meta/task/list": { items: [] },
+      "/v3/meta/task/create": { task_id: "task-1", title: "日常共享对话", team_id: "team-1", creator_user_id: "usr-owner", status: "running" },
+      "/v3/meta/task-agent/list": { items: [{ task_id: "task-1", agent_id: "agt-1" }] }
+    };
+    response.end(envelope(routes[request.url]));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  try {
+    await withSandbox(async ({ adapterRoot, deployDir }) => {
+      const gatewaySecret = "gateway-reject-cli-secret";
+      const adminSecret = "admin-reject-cli-secret";
+      await writeText(join(deployDir, ".env"), `MEMORY_CORE_PORT=${server.address().port}\nMEMORY_CORE_GATEWAY_API_KEY=${gatewaySecret}\n`);
+      await writeText(join(deployDir, ".admin-key"), adminSecret);
+      const result = await runCli({ adapterRoot, deployDir });
+      assert.deepEqual(result, {
+        code: 1, stdout: "", stderr: "[FAIL] 配置未写入：MemoryCore/Gateway 不可用或拒绝正式身份。\n"
+      });
+      assert.equal(`${result.stdout}${result.stderr}`.includes(gatewaySecret), false);
+      assert.equal(`${result.stdout}${result.stderr}`.includes(adminSecret), false);
+      assert.equal(`${result.stdout}${result.stderr}`.includes("sensitive Gateway rejection body"), false);
+    });
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
+});

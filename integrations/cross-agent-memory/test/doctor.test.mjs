@@ -82,7 +82,7 @@ test("doctor validates an active official graph and a visible chat_memory asset"
   });
 });
 
-test("doctor reports an invalid identity graph as failure and an unwritten chat memory as waiting", async () => {
+test("doctor reports an invalid identity graph and fails its chat-memory check", async () => {
   await withSandbox(async (rootDir) => {
     const metadata = healthyMetadata({ assets: [] });
     metadata.getAgent = async () => ({ agent_id: "agt-1", team_id: "team-other", owner_user_id: "usr-owner", status: "active" });
@@ -97,6 +97,14 @@ test("doctor reports an invalid identity graph as failure and an unwritten chat 
     const result = Object.fromEntries(checks.map(({ name, status }) => [name, status]));
     assert.equal(result.identity, "FAIL");
     assert.equal(result["chat-memory"], "FAIL");
+  });
+});
+
+test("doctor reports WAIT only when a valid official identity has not produced chat_memory yet", async () => {
+  await withSandbox(async (rootDir) => {
+    const checks = await runDoctor({ rootDir, nodeVersion: "25.2.1", healthCheck: async () => true, gatewayFactory: healthyGateway, metadataClient: healthyMetadata({ assets: [] }), hookChecker: async () => true });
+    assert.equal(checks.find((check) => check.name === "identity").status, "PASS");
+    assert.equal(checks.find((check) => check.name === "chat-memory").status, "WAIT");
   });
 });
 
@@ -186,6 +194,30 @@ test("doctor rejects every incomplete handler shape for Codex, Claude, and ZCode
   assert.equal(isClientHookConfigRegistered(configFor("zcode", zcode, false), "zcode", path), false);
 });
 
+test("doctor retains the full three-client handler negative matrix", () => {
+  const path = "C:/memory/hook-cli.mjs";
+  const codex = { type: "command", command: `node ${path} codex`, commandWindows: `node \"${path}\" codex`, timeout: 5 };
+  const claude = { type: "command", command: `node \"${path}\" claude`, timeout: 5 };
+  const zcode = { type: "process", command: "node", args: [path, "zcode"], enabled: true, timeoutMs: 5000 };
+  const configFor = (client, entry, enabled = true) => client === "zcode"
+    ? { hooks: { enabled, events: { UserPromptSubmit: [{ hooks: [entry] }], Stop: [{ hooks: [entry] }] } } }
+    : { hooks: { UserPromptSubmit: [{ hooks: [entry] }], Stop: [{ hooks: [entry] }] } };
+  for (const entry of [
+    { ...codex, type: "process" }, { ...codex, command: `node ${path}.old codex` },
+    { ...codex, commandWindows: `node \"${path}-backup\" codex` }, { ...codex, command: `node ${path} claude`, commandWindows: `node \"${path}\" claude` },
+    { ...codex, command: `bun ${path} codex` }, { ...codex, timeout: 0 }
+  ]) assert.equal(isClientHookConfigRegistered(configFor("codex", entry), "codex", path), false);
+  for (const entry of [
+    { ...claude, type: "process" }, { ...claude, command: `node \"${path}.old\" claude` },
+    { ...claude, command: `node \"${path}\" codex` }, { ...claude, command: `bun \"${path}\" claude` }, { ...claude, timeout: 0 }
+  ]) assert.equal(isClientHookConfigRegistered(configFor("claude", entry), "claude", path), false);
+  for (const entry of [
+    { ...zcode, type: "command" }, { ...zcode, command: "node.exe" }, { ...zcode, args: [`${path}.old`, "zcode"] },
+    { ...zcode, args: [path, "claude"] }, { ...zcode, args: [path, "zcode", "extra"] }, { ...zcode, enabled: false }, { ...zcode, timeoutMs: 0 }
+  ]) assert.equal(isClientHookConfigRegistered(configFor("zcode", entry), "zcode", path), false);
+  assert.equal(isClientHookConfigRegistered(configFor("zcode", zcode, false), "zcode", path), false);
+});
+
 test("doctor marks missing configuration and both metadata checks as failures", async () => {
   const root = await mkdtemp(join(tmpdir(), "cross-agent-doctor-missing-explicit-"));
   try {
@@ -238,3 +270,18 @@ test("doctor preserves both primary and cleanup errors in its sandbox helper", a
   await assert.rejects(sandbox(async () => { throw primary; }, async () => { throw cleanup; }),
     (error) => error instanceof AggregateError && error.errors[0] === primary && error.errors[1] === cleanup);
 });
+
+for (const [label, asset] of [
+  ["wrong asset ID", { asset_id: "chat_memory-team-1-other", asset_type: "chat_memory", team_id: "team-1", owner_user_id: "usr-owner", status: "active" }],
+  ["wrong team", { asset_id: "chat_memory-team-1-agt-1", asset_type: "chat_memory", team_id: "team-other", owner_user_id: "usr-owner", status: "active" }],
+  ["wrong owner", { asset_id: "chat_memory-team-1-agt-1", asset_type: "chat_memory", team_id: "team-1", owner_user_id: "usr-other", status: "active" }],
+  ["inactive status", { asset_id: "chat_memory-team-1-agt-1", asset_type: "chat_memory", team_id: "team-1", owner_user_id: "usr-owner", status: "archived" }]
+]) {
+  test(`doctor does not PASS a chat-memory asset with ${label}`, async () => {
+    await withSandbox(async (rootDir) => {
+      const checks = await runDoctor({ rootDir, nodeVersion: "25.2.1", healthCheck: async () => true, gatewayFactory: healthyGateway, metadataClient: healthyMetadata({ assets: [asset] }), hookChecker: async () => true });
+      assert.equal(checks.find((check) => check.name === "identity").status, "PASS");
+      assert.equal(checks.find((check) => check.name === "chat-memory").status, "FAIL");
+    });
+  });
+}
