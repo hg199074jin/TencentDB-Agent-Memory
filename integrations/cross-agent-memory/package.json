@@ -8,6 +8,7 @@
     "test": "node --test test/*.test.mjs",
     "doctor": "node src/doctor.mjs",
     "install-hooks": "node src/install-hooks.mjs install",
-    "uninstall-hooks": "node src/install-hooks.mjs uninstall"
+    "uninstall-hooks": "node src/install-hooks.mjs uninstall",
+    "restore-claude-minimax": "node src/restore-claude-minimax.mjs"
   }
 }
