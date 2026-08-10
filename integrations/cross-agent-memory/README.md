@@ -128,7 +128,7 @@ node src/restore-claude-minimax.mjs 'D:\可信备份\settings.json'
 
 Memory Hub 启动后，在浏览器打开：
 
-[http://localhost:8125/memory](http://localhost:8125/memory)
+[http://localhost:8125/#/memory](http://localhost:8125/#/memory)
 
 这是 **资产管理 → Chat_Memory** 的页面。先切换到 `个人跨 Agent 记忆` Team，再选择 `共享个人助手`；首轮成功写入后，应能看到该正式身份对应的 `chat_memory` 资产及其 L0–L3 内容。若首写后仍不可见，先运行 `node src/doctor.mjs`：`identity` 必须是 PASS，`chat-memory` 才可为 PASS；在尚未首写时显示 WAIT 是预期结果。MVP 不使用 Skill、Wiki 或 CodeGraph。
 
@@ -136,7 +136,13 @@ Memory Hub 启动后，在浏览器打开：
 
 本次接入只使用新的正式 Metadata 身份来承接**之后**的新会话：不会迁移、重命名、删除或覆盖旧的对话、旧资产、容器、镜像和卷。旧数据仍按原来的身份和位置保留；如需历史数据迁移，应另行使用项目迁移工具并先备份，不要把它混入 Hook 安装步骤。
 
-确认 Codex、Claude Code、ZCode 的活跃模型配置均已不再指向 `http://127.0.0.1:8096`（Claude 还应按上一节恢复为 MiniMax 直连）后，才可以在正式部署目录停止 Proxy：
+仅当以下三项**同时**满足时，才可以在正式部署目录停止 Proxy：
+
+1. Codex、Claude Code、ZCode 的有效模型配置均已不再指向 `http://127.0.0.1:8096`。
+2. Claude Code 已在新会话中确认 MiniMax 直连正常。
+3. 正式身份已完成首次写入，且 Hub 中对应的 `chat_memory` 资产及其 L0 对话原文均可读取。
+
+任一条件未满足都不要停止 Proxy：
 
 ```powershell
 Set-Location D:\TencentDB-Agent-Memory\deploy\global-images
@@ -251,7 +257,7 @@ node src/doctor.mjs
 自动测试和 `doctor` 不能替代真实客户端会话验收。以下步骤需要用户在三个客户端分别新开会话完成；本仓库不声称它们已完成：
 
 1. 在 Codex 新会话写入一条无敏感信息、可辨认的测试偏好，等待本轮结束。
-2. 在 Hub 的 [Chat_Memory 页面](http://localhost:8125/memory)确认正式身份的 `chat_memory` 资产可读；随后运行 `node src/doctor.mjs`，确认 `identity` 与 `chat-memory` 均为 PASS。
+2. 在 Hub 的 [Chat_Memory 页面](http://localhost:8125/#/memory)确认正式身份的 `chat_memory` 资产可读；随后运行 `node src/doctor.mjs`，确认 `identity` 与 `chat-memory` 均为 PASS。
 3. 分别新开 Claude Code 和 ZCode 会话，确认能收到该测试偏好；Claude Code 还应确认仍直连 MiniMax，而非 `8096`。
 4. 验收后可在任一客户端补充一条无敏感测试信息并跨端检查一次；不要用真实密码、Token、私钥或业务机密作测试内容。
 
