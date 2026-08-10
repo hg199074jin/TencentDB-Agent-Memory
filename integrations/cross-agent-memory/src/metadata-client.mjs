@@ -29,7 +29,7 @@ export class MetadataClient {
   }
 
   async listTeams({ userId, name }) {
-    return listItems(await this.#post("/v3/meta/team/list", { user_id: userId, name, limit: 1000 }));
+    return listItems(await this.#post("/v3/meta/team/list", { user_id: userId, name, limit: 100 }));
   }
 
   async createTeam({ name, ownerUserId }) {
@@ -37,7 +37,7 @@ export class MetadataClient {
   }
 
   async listAgents({ teamId, name }) {
-    return listItems(await this.#post("/v3/meta/agent/list", { team_id: teamId, name, limit: 1000 }));
+    return listItems(await this.#post("/v3/meta/agent/list", { team_id: teamId, name, limit: 100 }));
   }
 
   async createAgent({ teamId, ownerUserId, name }) {
@@ -49,7 +49,7 @@ export class MetadataClient {
   }
 
   async listTasks({ teamId, title }) {
-    return listItems(await this.#post("/v3/meta/task/list", { team_id: teamId, title, limit: 1000 }));
+    return listItems(await this.#post("/v3/meta/task/list", { team_id: teamId, title, limit: 100 }));
   }
 
   async createTask({ teamId, creatorUserId, title, agentId }) {
@@ -62,7 +62,7 @@ export class MetadataClient {
   }
 
   async listTaskAgents({ taskId }) {
-    return listItems(await this.#post("/v3/meta/task-agent/list", { task_id: taskId, limit: 1000 }));
+    return listItems(await this.#post("/v3/meta/task-agent/list", { task_id: taskId, limit: 100 }));
   }
 
   async getUser(userId) { return this.#post("/v3/meta/user/get", { user_id: userId }); }
@@ -74,7 +74,7 @@ export class MetadataClient {
     return listItems(await this.#post("/v3/meta/asset/list", {
       team_id: teamId,
       asset_type: "chat_memory",
-      limit: 1000
+      limit: 100
     }));
   }
 

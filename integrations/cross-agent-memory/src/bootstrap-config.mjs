@@ -18,9 +18,9 @@ const DEFAULT_DEPLOY_DIR = resolve(DEFAULT_ADAPTER_ROOT, "..", "..", "deploy", "
 const BEARER_DISABLED_FALLBACK = "local-bearer-disabled-compatibility";
 
 export const OFFICIAL_IDENTITY_NAMES = Object.freeze({
-  team: "Cross-Agent Memory",
-  agent: "Cross-Agent Memory Shared Agent",
-  task: "Cross-Agent Memory Shared Task"
+  team: "个人跨 Agent 记忆",
+  agent: "共享个人助手",
+  task: "日常共享对话"
 });
 
 class BootstrapError extends Error {
@@ -104,9 +104,9 @@ function metadataFailure(message = "Metadata identity validation failed") {
   return new BootstrapError("metadata", message);
 }
 
-function activeEntity(entity, idField) {
+function validEntity(entity, idField, prefix, statuses) {
   if (entity === null || typeof entity !== "object" || Array.isArray(entity) ||
-    typeof entity[idField] !== "string" || entity[idField].trim() === "" || entity.status !== "active") {
+    typeof entity[idField] !== "string" || !entity[idField].startsWith(prefix) || !statuses.includes(entity.status)) {
     throw metadataFailure();
   }
   return entity;
@@ -122,23 +122,23 @@ function exactOne(items, nameField, name) {
 async function resolveOfficialIdentity(metadata) {
   let user;
   try {
-    user = activeEntity(await metadata.verifyCurrentUser(), "user_id");
+    user = validEntity(await metadata.verifyCurrentUser(), "user_id", "usr-", ["active"]);
   } catch (error) {
     if (error instanceof BootstrapError) throw error;
     throw metadataFailure();
   }
   const userId = user.user_id;
 
-  async function oneOrCreate({ list, create, nameField, name, idField, valid }) {
+  async function oneOrCreate({ list, create, nameField, name, idField, prefix, statuses, valid }) {
     let found;
     try {
       found = exactOne(await list(), nameField, name);
       if (found !== null) {
-        found = activeEntity(found, idField);
+        found = validEntity(found, idField, prefix, statuses);
         if (!valid(found)) throw metadataFailure("Metadata relationship mismatch");
         return found;
       }
-      const created = activeEntity(await create(), idField);
+      const created = validEntity(await create(), idField, prefix, statuses);
       if (created[nameField] !== name || !valid(created)) throw metadataFailure("Metadata relationship mismatch");
       return created;
     } catch (error) {
@@ -153,6 +153,8 @@ async function resolveOfficialIdentity(metadata) {
     nameField: "name",
     name: OFFICIAL_IDENTITY_NAMES.team,
     idField: "team_id",
+    prefix: "team-",
+    statuses: ["active"],
     valid: (item) => item.owner_user_id === userId
   });
   const teamId = team.team_id;
@@ -162,6 +164,8 @@ async function resolveOfficialIdentity(metadata) {
     nameField: "name",
     name: OFFICIAL_IDENTITY_NAMES.agent,
     idField: "agent_id",
+    prefix: "agt-",
+    statuses: ["active"],
     valid: (item) => item.team_id === teamId && item.owner_user_id === userId
   });
   const agentId = agent.agent_id;
@@ -171,6 +175,8 @@ async function resolveOfficialIdentity(metadata) {
     nameField: "title",
     name: OFFICIAL_IDENTITY_NAMES.task,
     idField: "task_id",
+    prefix: "task-",
+    statuses: ["running", "completed"],
     valid: (item) => item.team_id === teamId && item.creator_user_id === userId
   });
   let links;

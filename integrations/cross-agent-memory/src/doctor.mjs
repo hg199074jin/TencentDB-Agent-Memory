@@ -121,9 +121,9 @@ async function defaultHealthCheck(config) {
   }
 }
 
-function activeEntity(entity, idField) {
+function validEntity(entity, idField, prefix, statuses) {
   return entity !== null && typeof entity === "object" && !Array.isArray(entity) &&
-    typeof entity[idField] === "string" && entity[idField].trim() !== "" && entity.status === "active";
+    typeof entity[idField] === "string" && entity[idField].startsWith(prefix) && statuses.includes(entity.status);
 }
 
 async function defaultMetadataClient(config, deployDir) {
@@ -139,10 +139,10 @@ async function officialIdentityValid(metadata, identity) {
     metadata.getAgent(identity.agentId),
     metadata.getTask(identity.taskId)
   ]);
-  if (!activeEntity(user, "user_id") || user.user_id !== identity.userId ||
-    !activeEntity(team, "team_id") || team.team_id !== identity.teamId || team.owner_user_id !== identity.userId ||
-    !activeEntity(agent, "agent_id") || agent.agent_id !== identity.agentId || agent.team_id !== identity.teamId || agent.owner_user_id !== identity.userId ||
-    !activeEntity(task, "task_id") || task.task_id !== identity.taskId || task.team_id !== identity.teamId || task.creator_user_id !== identity.userId) {
+  if (!validEntity(user, "user_id", "usr-", ["active"]) || user.user_id !== identity.userId ||
+    !validEntity(team, "team_id", "team-", ["active"]) || team.team_id !== identity.teamId || team.owner_user_id !== identity.userId ||
+    !validEntity(agent, "agent_id", "agt-", ["active"]) || agent.agent_id !== identity.agentId || agent.team_id !== identity.teamId || agent.owner_user_id !== identity.userId ||
+    !validEntity(task, "task_id", "task-", ["running", "completed"]) || task.task_id !== identity.taskId || task.team_id !== identity.teamId || task.creator_user_id !== identity.userId) {
     return false;
   }
   const links = await metadata.listTaskAgents({ taskId: identity.taskId });
@@ -229,21 +229,31 @@ export async function runDoctor({
     checks.push(fail("chat-memory", "配置缺失，无法验证 Hub 资产"));
   } else {
     let metadata;
+    let identityValid = false;
     try {
       metadata = metadataClient ?? await metadataClientFactory(config, deployDir);
       if (!await officialIdentityValid(metadata, config.identity)) throw new Error("invalid graph");
+      identityValid = true;
       checks.push(pass("identity", "正式身份存在、归属一致且状态有效"));
     } catch {
       checks.push(fail("identity", "正式身份不存在、归属不一致或状态无效"));
     }
-    try {
+    if (!identityValid) {
+      checks.push(fail("chat-memory", "正式身份无效，无法验证 Hub chat_memory 资产"));
+    } else try {
       metadata ??= metadataClient ?? await metadataClientFactory(config, deployDir);
       const assets = await metadata.listChatMemoryAssets({ teamId: config.identity.teamId, agentId: config.identity.agentId });
       if (!Array.isArray(assets)) throw new Error("invalid assets");
       if (assets.length === 0) checks.push(wait("chat-memory", "尚未首写；等待 chat_memory 资产生成"));
-      else if (assets.some((asset) => asset === null || typeof asset !== "object" || asset.asset_type !== "chat_memory" || asset.team_id !== config.identity.teamId)) {
+      else {
+        const expectedAsset = assets.filter((asset) => asset !== null && typeof asset === "object" &&
+          asset.asset_id === `chat_memory-${config.identity.teamId}-${config.identity.agentId}`);
+        if (expectedAsset.length !== 1 || expectedAsset[0].asset_type !== "chat_memory" ||
+          expectedAsset[0].team_id !== config.identity.teamId || expectedAsset[0].owner_user_id !== config.identity.userId ||
+          expectedAsset[0].status !== "active") {
         checks.push(fail("chat-memory", "Hub chat_memory 资产不可见或无效"));
-      } else checks.push(pass("chat-memory", "Hub chat_memory 资产可见"));
+        } else checks.push(pass("chat-memory", "Hub chat_memory 资产可见"));
+      }
     } catch {
       checks.push(fail("chat-memory", "无法验证 Hub chat_memory 资产"));
     }
