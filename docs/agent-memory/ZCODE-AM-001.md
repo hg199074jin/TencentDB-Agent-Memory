@@ -92,7 +92,8 @@
 
 ## 8. 提交与远端
 
-- commit：见分支 `feat/gpt-am-001-agent-memory`（`docs/agent-memory/**` + `integrations/agent-memory/**`）
-- 远端：`git@github.com:hg199074jin/TencentDB-Agent-Memory.git` 的 `feat/gpt-am-001-agent-memory`
+- commit：`e6a2873` feat(agent-memory): model-agnostic four-client shared memory (GPT-AM-001)
+- 分支：https://github.com/hg199074jin/TencentDB-Agent-Memory/tree/feat/gpt-am-001-agent-memory
+- 报告直链：https://github.com/hg199074jin/TencentDB-Agent-Memory/blob/feat/gpt-am-001-agent-memory/docs/agent-memory/ZCODE-AM-001.md
 - PR：**不创建**（Fork 默认分支 `fe3230f` 陈旧两个月，建 PR 会把大量 upstream 提交包进 diff；留在可审查功能分支）
 - 官方公开 PR：**未提交**（未授权）
