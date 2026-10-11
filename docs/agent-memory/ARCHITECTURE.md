@@ -70,7 +70,29 @@ OpenCode Plugin ─────────────────────�
 **双路径共存**：会话模型 provider 为 `tencentdb-agent-memory`（官方 Proxy 适配）时，
 插件/hook 完全静默（注入与写入由代理负责），避免双重注入与双写。
 
-## 4. 幂等契约（M2）
+## 4. 幂等契约（M2 + R2 收口）
+
+**写入送达状态（delivery 判别联合，R2 P0-A）**：
+
+| delivery | 触发 | 状态迁移 | 重试策略 |
+| --- | --- | --- | --- |
+| `definitely_not_sent` | 连接拒绝/DNS/发送前取消 | pending（retryable） | 可安全重试 |
+| `maybe_sent` | 发送后超时/断连/部分响应/5xx/408/429 | unknown | **禁止自动重试**；仅 reconcile 读回对账 |
+| `rejected` | 4xx/envelope 业务错误/客户端校验失败 | denied | 不重试；禁止退化身份重发 |
+
+**锁（R2 P0-B）**：跨进程 `mkdir` 互斥 + owner token（pid+uuid+heartbeat）；
+`mkdir→owner.json` 窗口 1s 宽限期（禁止抢锁）；仅持有者可释放；stale 回收需
+pid 死亡或心跳超龄 30s；**拿不到锁 → deferred，绝不发送**。
+**持久化（R2 P1-C）**：merge-on-write + 跨进程写锁；失败 → degraded（后续一律
+deferred）；恢复自动清除。不同 key 并发更新不相互覆盖。
+**内容匹配（R2 P1-E）**：turnKey 是唯一主判据；`alreadyStored` 仅作 reconcile/spool
+的“疑似重复”信号（`suspected: true`），不得把新 turn 判为已写。
+**消息长度（R2 P1-D）**：单条 ≤8192 码点（官方 v3-api），超限回合跳过并记录
+结构化 reason（不悄悄截断）；`readScenario({path})`、`listScenarios({path_prefix})`
+与官方 SDK 逐字段一致。
+
+无 server-side idempotency 时，本实现为**客户端最佳努力幂等**（client best-effort
+idempotency），不宣称全局 exactly-once。
 
 | 状态 | 含义 | 迁移 |
 | --- | --- | --- |

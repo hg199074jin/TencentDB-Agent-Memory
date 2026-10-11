@@ -3,30 +3,73 @@
  *
  * 契约对齐官方 SDK `@tencentdb-agent-memory/memory-sdk-ts-v2`（v3）：
  *   - 隔离上下文 V3IsolationContext{ team_id, agent_id, user_id, session_id?, task_id? }
- *   - 方法名与 SDK 一致：addConversation / queryConversation / searchConversation /
- *     searchAtomic / queryAtomic / listScenarios / readScenario / readCore
- *   - 服务级 Bearer（Authorization）+ x-tdai-service-id 头
- *   - 统一 envelope { code, message, request_id, data } 校验；code!=0 抛错
- *   - 每次调用可配超时（AbortController），传输失败归类 CoreTransportError
+ *   - 方法名与 SDK 一致；listScenarios({ path_prefix })、readScenario({ path })
+ *     与官方 client.ts 逐字段一致（R2 修复：旧版误用 session_id/scenario 字段）
+ *   - /v3/conversation/add 单条消息 content 1–8192 字符（官方 v3-api 文档），
+ *     按码点计数；超限在客户端即拒绝（delivery='rejected'），不进入服务端调用
  *
- * 本客户端不平行重造 SDK：端点/envelope/字段与官方 v3 一致，便于随时替换为官方 SDK
- * （方法同名、隔离字段同名，属 drop-in）。
+ * R2 关键修复（P0-A）：所有失败以**判别联合 delivery** 表达写入送达状态：
+ *   - 'definitely_not_sent'  请求未离开客户端（连接拒绝/DNS/发送前取消）→ 可安全重试
+ *   - 'maybe_sent'           请求已发出但结果未知（超时/断连/部分响应/5xx/408/429）
+ *                           → 调用方必须按 unknown 对账，禁止自动重试
+ *   - 'rejected'             服务端明确拒绝（4xx/envelope 业务错误/客户端校验失败）
+ *                           → 不重试；禁止退化身份重发
+ * 无 server-side idempotency 时不宣称全局 exactly-once；调用方最佳努力幂等。
  */
 
-export class CoreTransportError extends Error {
-  constructor(message, { cause } = {}) {
+export class CoreDeliveryError extends Error {
+  constructor(message, { delivery, status, code, requestId, cause } = {}) {
     super(message);
-    this.name = "CoreTransportError";
+    this.name = "CoreDeliveryError";
+    this.delivery = delivery;
+    this.status = status;
+    this.code = code;
+    this.requestId = requestId;
     this.cause = cause;
   }
 }
 
-export class CoreApiError extends Error {
-  constructor(message, { code, requestId } = {}) {
-    super(message);
+/** 兼容旧名：传输类错误的基类（delivery 形参可缺省，调用方应读 delivery 字段）。 */
+export class CoreTransportError extends CoreDeliveryError {}
+
+/** 服务端业务/协议拒绝（HTTP 4xx、envelope code!=0、客户端校验失败）。 */
+export class CoreApiError extends CoreDeliveryError {
+  constructor(message, options = {}) {
+    super(message, { delivery: "rejected", ...options });
     this.name = "CoreApiError";
-    this.code = code;
-    this.requestId = requestId;
+  }
+}
+
+/** v3 官方限制：单条消息 1–8192 字符（码点）。 */
+export const MAX_MESSAGE_CODE_POINTS = 8192;
+export const MAX_MESSAGES_PER_TURN = 100;
+
+function codePointLength(value) {
+  let count = 0;
+  for (const _char of value) count += 1;
+  return count;
+}
+
+/** 客户端侧消息校验：拒绝超限/空消息/过多消息（delivery='rejected'，不进网络）。 */
+export function validateConversationMessages(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    throw new CoreApiError("conversation/add requires at least one message", { code: "invalid_request" });
+  }
+  if (messages.length > MAX_MESSAGES_PER_TURN) {
+    throw new CoreApiError(`conversation/add accepts at most ${MAX_MESSAGES_PER_TURN} messages`, { code: "invalid_request" });
+  }
+  for (const [index, message] of messages.entries()) {
+    const content = message?.content;
+    if (typeof content !== "string" || content.length === 0) {
+      throw new CoreApiError(`conversation/add message[${index}].content must be a non-empty string`, { code: "invalid_request" });
+    }
+    const points = codePointLength(content);
+    if (points > MAX_MESSAGE_CODE_POINTS) {
+      throw new CoreApiError(
+        `conversation/add message[${index}] content is ${points} code points (> ${MAX_MESSAGE_CODE_POINTS})`,
+        { code: "invalid_request" },
+      );
+    }
   }
 }
 
@@ -36,6 +79,9 @@ function requiredString(value, field) {
   }
   return value.trim();
 }
+
+/** 连接层错误码：请求确定未离开客户端。 */
+const NOT_SENT_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "ECONNABORTED"]);
 
 export class CoreClient {
   constructor({
@@ -94,12 +140,14 @@ export class CoreClient {
     return this.#post("/v3/atomic/query", withoutUndefined({ limit, offset, session_id: sessionId }), signal);
   }
 
-  async listScenarios({ sessionId } = {}, { signal } = {}) {
-    return this.#post("/v3/scenario/ls", withoutUndefined({ session_id: sessionId }), signal);
+  async listScenarios({ pathPrefix } = {}, { signal } = {}) {
+    // 官方契约：path_prefix（R2 修复：旧版误发 session_id）
+    return this.#post("/v3/scenario/ls", withoutUndefined({ path_prefix: pathPrefix }), signal);
   }
 
-  async readScenario({ name }, { signal } = {}) {
-    return this.#post("/v3/scenario/read", withoutUndefined({ scenario: name }), signal);
+  async readScenario({ path, name }, { signal } = {}) {
+    // 官方契约：path（name 为兼容别名）
+    return this.#post("/v3/scenario/read", withoutUndefined({ path: path ?? name }), signal);
   }
 
   async readCore(_params = {}, { signal } = {}) {
@@ -109,6 +157,7 @@ export class CoreClient {
   // ── v3 写接口 ────────────────────────────────────────────────────────────
 
   async addConversation({ sessionId, messages }, { signal } = {}) {
+    validateConversationMessages(messages); // 客户端前置校验，避免服务端永久拒绝→spool 死循环
     return this.#post(
       "/v3/conversation/add",
       withoutUndefined({ session_id: sessionId, messages }),
@@ -125,9 +174,11 @@ export class CoreClient {
     if (externalSignal?.aborted) cancel();
     else externalSignal?.addEventListener("abort", cancel, { once: true });
 
+    let requestStarted = false;
     try {
       let response;
       try {
+        requestStarted = true;
         response = await this.fetchImpl(`${this.endpoint}${path}`, {
           method: "POST",
           signal: controller.signal,
@@ -140,17 +191,34 @@ export class CoreClient {
         });
       } catch (error) {
         const aborted = error?.name === "AbortError" || controller.signal.aborted;
-        throw new CoreTransportError(aborted ? `core request timeout after ${this.timeoutMs}ms: ${path}` : `core transport error: ${path}: ${error?.message ?? error}`, { cause: error });
+        const notSentCode = !aborted && NOT_SENT_CODES.has(error?.cause?.code);
+        // 未开始发送 / 连接层失败 → definitely_not_sent；其余（含发送后超时）→ maybe_sent
+        const delivery = !requestStarted || notSentCode ? "definitely_not_sent" : "maybe_sent";
+        const message = aborted
+          ? `core request ${requestStarted ? "timed out" : "aborted before send"} after ${this.timeoutMs}ms: ${path}`
+          : `core transport error (${delivery}): ${path}: ${error?.message ?? error}`;
+        throw new CoreTransportError(message, { delivery, cause: error });
       }
 
       let envelope;
       try {
         envelope = await response.json();
       } catch (error) {
-        throw new CoreTransportError(`core invalid JSON: ${path} HTTP ${response.status}`, { cause: error });
+        // 响应头已到达：服务端已受理请求，结果未知
+        throw new CoreTransportError(`core partial/invalid response body: ${path} HTTP ${response.status}`, {
+          delivery: "maybe_sent",
+          status: response.status,
+          cause: error,
+        });
       }
       if (!response.ok) {
-        throw new CoreApiError(`core HTTP ${response.status}: ${path}`, { code: response.status, requestId: envelope?.request_id });
+        // 授权/校验类 4xx → 明确拒绝；408/429/5xx → 无法证明未落库，保守按 maybe_sent
+        const retryableStatus = response.status === 408 || response.status === 429 || response.status >= 500;
+        throw new CoreTransportError(`core HTTP ${response.status}: ${path}`, {
+          delivery: retryableStatus ? "maybe_sent" : "rejected",
+          status: response.status,
+          requestId: envelope?.request_id,
+        });
       }
       if (!envelope || typeof envelope !== "object" || typeof envelope.code !== "number") {
         throw new CoreApiError(`core invalid envelope: ${path}`, { code: -1, requestId: envelope?.request_id });

@@ -130,6 +130,34 @@ function okHandler(data) {
     }),
   );
   const client = new CoreClient({ ...ENV, fetchImpl, timeoutMs: 30 });
-  await assert.rejects(() => client.readCore(), /aborted|timeout/i);
+  await assert.rejects(() => client.readCore(), /timed out|aborted/i);
   console.log("C7 timeout aborts: PASS");
+}
+
+// ── R2 RED pins：官方 v3 SDK 契约 ───────────────────────────────────────────
+
+// D-C1: readScenario 必须发送 { path }（官方 V3ScenarioReadRequest.path）
+{
+  const fetchImpl = mockFetch(okHandler({ scenario: "s" }));
+  const client = new CoreClient({ ...ENV, fetchImpl });
+  await client.readScenario({ name: "scene-a.md" });
+  const body = JSON.parse(fetchImpl.calls[0].init.body);
+  assert.equal(body.path, "scene-a.md", `readScenario must send path=, got ${JSON.stringify(body)}`);
+  assert.equal(body.scenario, undefined, "readScenario must not send legacy scenario field");
+  console.log("D-C1 readScenario sends path: PASS");
+}
+
+// D-C2: listScenarios 必须发送 { path_prefix }，不得用 session_id
+{
+  const fetchImpl = mockFetch(okHandler({ entries: [] }));
+  const client = new CoreClient({ ...ENV, fetchImpl });
+  await client.listScenarios({ pathPrefix: "proj/" });
+  const body = JSON.parse(fetchImpl.calls[0].init.body);
+  assert.equal(body.path_prefix, "proj/", `listScenarios must send path_prefix, got ${JSON.stringify(body)}`);
+  assert.equal(body.session_id, undefined, "listScenarios must not send session_id");
+  await client.listScenarios();
+  const body2 = JSON.parse(fetchImpl.calls[1].init.body);
+  assert.equal(body2.path_prefix, undefined);
+  assert.equal(body2.session_id, undefined);
+  console.log("D-C2 listScenarios sends path_prefix: PASS");
 }

@@ -100,7 +100,7 @@ for (const status of ["cancelled", "failed"]) {
   const h = harness({
     sendImpl: () => {
       attempts += 1;
-      throw Object.assign(new Error("network reset after send"), { afterSend: true });
+      throw Object.assign(new Error("network reset after send"), { delivery: "maybe_sent" });
     },
   });
   const receipt = await captureTurn({ client: h.client, identity: IDENTITY, turn: TURN, dedupe: h.dedupe });
@@ -119,7 +119,7 @@ for (const status of ["cancelled", "failed"]) {
   const h = harness({
     sendImpl: () => {
       attempts += 1;
-      if (attempts === 1) throw new Error("ECONNREFUSED");
+      if (attempts === 1) throw Object.assign(new Error("ECONNREFUSED"), { delivery: "definitely_not_sent" });
       return { total: 2 };
     },
   });
@@ -131,16 +131,9 @@ for (const status of ["cancelled", "failed"]) {
   console.log("G7 pre-send failure retryable: PASS");
 }
 
-// G8: 读回校验：服务端已有同内容 → 标记 acknowledged 不重写
-{
-  const h = harness({
-    readBackImpl: () => ({ messages: [{ role: "user", content: "你好" }, { role: "assistant", content: "你好！有什么可以帮你？" }] }),
-  });
-  const receipt = await captureTurn({ client: h.client, identity: IDENTITY, turn: TURN, dedupe: h.dedupe });
-  assert.equal(receipt.status, "acknowledged");
-  assert.equal(h.calls.filter((c) => c.messages).length, 0);
-  console.log("G8 read-back dedupe: PASS");
-}
+// G8（R2 删除）：旧行为"服务端已有同内容 → 自动 acknowledged 不重写"是 P1-E 缺陷
+// ——同内容不同 turn 是真实历史。现行契约：turnKey 是唯一主判据，内容匹配仅用于
+// reconcile/spool 的疑似判重（见 DC1/DC2 与 retryQueuedCaptures 测试）。
 
 // G9: 进程重启后（新 dedupe 实例 + 持久 state 目录）同 turn 不重写
 {
@@ -154,4 +147,49 @@ for (const status of ["cancelled", "failed"]) {
   assert.equal(receipt.status, "duplicate");
   assert.equal(h2.calls.filter((c) => c.messages).length, 0);
   console.log("G9 restart-safe idempotent: PASS");
+}
+
+// ── R2 RED pins：Core v3 单条消息 1–8192 字符（v3-api 文档 §conversation/add）──
+
+// D-L1: 超过 8192 字符的 user/assistant → 跳过捕获并给出结构化 reason（不悄悄截断）
+{
+  const long = "长".repeat(8193);
+  for (const [field, turn] of [
+    ["user", { ...TURN, originalUser: long }],
+    ["assistant", { ...TURN, finalAssistant: long }],
+  ]) {
+    const h = harness();
+    const receipt = await captureTurn({ client: h.client, identity: IDENTITY, turn, dedupe: h.dedupe });
+    assert.equal(receipt.status, "skipped", `${field} over limit must skip`);
+    assert.equal(receipt.reason, "message-too-long");
+    assert.equal(h.calls.filter((c) => c.messages).length, 0, "over-limit message must never be sent");
+    console.log(`D-L1 ${field} >8192 skipped with reason: PASS`);
+  }
+}
+
+// D-L2: 恰好 8192 → 允许；8193 → 拒绝（边界）
+{
+  // 注意：不能用 x/y 等 base64 字符集构造（会被隐私层替换为占位符，绕过长验证）
+  const exact = "中".repeat(8192);
+  const h1 = harness();
+  const r1 = await captureTurn({ client: h1.client, identity: IDENTITY, turn: { ...TURN, finalAssistant: exact }, dedupe: h1.dedupe });
+  assert.equal(r1.status, "acknowledged", "exactly 8192 must be captured");
+  const over = "中".repeat(8193);
+  const h2 = harness();
+  const r2 = await captureTurn({ client: h2.client, identity: IDENTITY, turn: { ...TURN, finalAssistant: over }, dedupe: h2.dedupe });
+  assert.equal(r2.status, "skipped");
+  console.log("D-L2 8192 boundary: PASS");
+}
+
+// D-L3: 非 ASCII 按码点计数（中文/ emoji 不按 UTF-16 单元误判）
+{
+  const emoji = "😀".repeat(4096); // 8192 个 UTF-16 单元 / 4096 码点
+  const h = harness();
+  const r = await captureTurn({ client: h.client, identity: IDENTITY, turn: { ...TURN, finalAssistant: emoji }, dedupe: h.dedupe });
+  assert.equal(r.status, "acknowledged", "4096 emoji code points = 4096 chars, must be captured");
+  const tooMany = "😀".repeat(8193); // 8193 码点 > 8192
+  const h2 = harness();
+  const r2 = await captureTurn({ client: h2.client, identity: IDENTITY, turn: { ...TURN, finalAssistant: tooMany }, dedupe: h2.dedupe });
+  assert.equal(r2.status, "skipped", "8193 emoji code points must be skipped (code-point counting, not UTF-16)");
+  console.log("D-L3 non-ASCII code-point counting: PASS");
 }

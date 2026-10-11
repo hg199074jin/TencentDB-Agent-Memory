@@ -219,8 +219,13 @@ async function stop(client, input, deadline) {
       },
     });
 
-    // 发送前失败（retryable）→ 入本地队列稍后重试（读回校验仍由 dedupe 把关）
-    if (capture.status === "retryable") {
+    // R2 状态路由：
+    //   retryable（definitely_not_sent）→ 入 durable spool 稍后重试；
+    //   unknown（maybe_sent）→ 保留 pending + spool（仅 read-back 对账，不盲发）；
+    //   deferred（锁/持久化不可用）→ 保留 pending，下次 Stop 自然重试；
+    //   denied（服务端明确拒绝）→ 不重试、不入队；
+    //   acknowledged/duplicate → 完成。
+    if (capture.status === "retryable" || capture.status === "unknown") {
       await enqueueCapture({
         memorySessionId: capture.sessionId,
         messages: capture.messages,
@@ -242,11 +247,9 @@ async function stop(client, input, deadline) {
 
   const captureStatus = ["acknowledged", "duplicate"].includes(capture.status)
     ? "captured"
-    : capture.status === "unknown"
-      ? "unknown-ack"
-      : capture.status === "queued"
-        ? "queued"
-        : capture.status;
+    : ["unknown", "retryable", "queued", "deferred", "denied", "skipped"].includes(capture.status)
+      ? capture.status
+      : capture.status;
   return {
     output: {},
     status: retry.budgetExceeded ? `${captureStatus}-retry-timeout` : captureStatus

@@ -86,3 +86,38 @@ E2E 的 LLM 配置从生产 `.env` 的 `MEMORY_LLM_*` 读取（仅用于隔离�
    结构差异需单独验证（生产现为 1.18.35，无兼容性问题）。
 5. **L2/L3 观察**：E2E G 门验证到 L1 可检索；L2/L3 由 Core 管线异步生成，
    生产实例长期观察有效，隔离实例内未单独设断言（等待预算内未强制）。
+
+## 4. R2 收口证据（2026-10-11）
+
+### 4.1 测试规模
+
+```
+npm test           → 19 套 / 125 断言全绿（含 delivery/dedupe/capture 的 R2 RED pins）
+npm run test:e2e   → 12 测试全绿（gates A–K；镜像固定 digest sha256:338847edc646…）
+```
+
+### 4.2 历史数据与修复后数据（证据一致性勘误）
+
+| 观测 | 发生条件 | 现状态 |
+| --- | --- | --- |
+| “3 进程并发最多 2 条 L0” | **锁修复前**（DB9/D9 无 owner 宽限期，存在抢锁窗口） | 已定位为真实竞态并修复；D9 连续 5 次恰好 1 次发送；E2E-C3 断言收紧为 `=== 1` |
+| “4 进程恰好 1 次发送”（ZCODE-AM-001） | 修复初期断言，但当时存在偶发双发 | 修复后 5/5 稳定通过 |
+| maybe_sent 被当 retryable | P0-A：错误无 delivery 字段 | DA1–DA7 + E2E-J：全部改为判别联合，maybe_sent→unknown 禁重试 |
+| 内容匹配自动 ACK | P1-E：同内容不同 turn 被漏记 | DC1：同内容不同 turn 两组都写；DC2/D8：内容匹配仅 reconcile 疑似信号 |
+
+### 4.3 新增/变更的关键 pin
+
+| 套件 | pin | 断言 |
+| --- | --- | --- |
+| delivery | DA1–DA7 | 三种 delivery 分类 + dedupe/capture 链路口迁移 |
+| core-client | D-C1/D-C2 | `readScenario→{path}`、`listScenarios→{path_prefix}` |
+| capture | D-L1–L3 | 8192 码点边界、超限跳过+reason、emoji 码点计数 |
+| dedupe | DB1–DB4/DC1/DC2/D8/D9 | 锁不可用不发送、持久化失败降级、崩溃 sending→unknown、并发 key 不互覆、同内容异 turn 双写、suspected 标记、execute 无写前内容匹配、多进程恰好一次 |
+| e2e | I/J/K | claude/zcode 真实 hook JSON；maybe_sent/refused/403 注入；ACK 崩溃恢复、磁盘满 deferred |
+
+### 4.4 环境与隔离
+
+- 隔离实例：容器 `am001-e2e-core` / 卷 `am001-e2e-data` / 端口 `127.0.0.1:18420`；镜像按 digest 固定；成功与失败路径均自动清理。
+- 生产 `tdai-*` 三容器全程未停未改（E2E 前后 health/uptime 一致）。
+- 合成语料 `AM001-SYNTH-*`/`AM001-PRIV-*`/`AM001-DISTILL-*`/`AM001-INJECTED*`，与生产 5200+ L0 无交集。
+- 测试日志不打印生产密钥或真实 L0（E2E 仅从 `.env` 读取 LLM 配置注入隔离容器环境变量）。

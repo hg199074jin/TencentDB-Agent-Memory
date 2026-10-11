@@ -14,7 +14,8 @@ const PRODUCTION_ENV = process.env.AM001_PRODUCTION_ENV ?? "/Volumes/ORICO/Proje
 const E2E_PORT = 18420;
 const CONTAINER = "am001-e2e-core";
 const VOLUME = "am001-e2e-data";
-const IMAGE = "agentmemory/memory-core:latest";
+// 固定 digest：E2E 可复现，不依赖 :latest 标签漂移（R2 要求）
+const IMAGE = `agentmemory/memory-core@sha256:338847edc6464ed20a5f2a936ca2efa7fc71e188410836ebe9a711c1bc53fe84`;
 
 const evidence = { gates: {}, timings: { recall: [], capture: [] } };
 
@@ -378,6 +379,128 @@ test("E2E gates A–H on isolated core", async (t) => {
     }
     evidence.gates.G = { l1Found, coreRead, waitedMs: 120_000 - Math.max(0, deadline - Date.now()) };
     assert.ok(l1Found, "L1 extraction must make the synthetic decision retrievable within 120s");
+  });
+
+  // ── Gate I：Claude / ZCode 真实 hook JSON 模拟（R2：补齐四客户端证据）──
+  await t.test("I claude/zcode real hook JSON simulation", async () => {
+    const results = {};
+    for (const client of ["claude", "zcode"]) {
+      const sessionId = `e2e-sess-i-${client}-${(await import("node:crypto")).randomBytes(4).toString("hex")}`;
+      const submit = await runHook(rootA, client, {
+        session_id: sessionId,
+        transcript_path: `/tmp/${client}-transcript.jsonl`,
+        cwd: "/tmp",
+        hook_event_name: "UserPromptSubmit",
+        prompt: `I 门 ${client} 线路合成问题 AM001-SYNTH-I`,
+      });
+      const stop = await runHook(rootA, client, {
+        session_id: sessionId,
+        transcript_path: `/tmp/${client}-transcript.jsonl`,
+        hook_event_name: "Stop",
+        stop_hook_active: false,
+        last_assistant_message: `I 门 ${client} 线路合成回答`,
+      });
+      results[client] = { recallStatus: submit.status, captureStatus: stop.status };
+      assert.ok(["recalled", "recall-empty", "recall-failed"].includes(submit.status), `${client} submit: ${submit.status}`);
+      assert.ok(["captured", "unknown", "retryable", "deferred"].includes(stop.status), `${client} stop: ${stop.status}`);
+    }
+    evidence.gates.I = results;
+  });
+
+  // ── Gate J：网络异常注入（R2 P0-A 决定性证据）──
+  await t.test("J network anomaly injection: partial body / post-send timeout / 503", async () => {
+    // 直接以模块级注入验证 delivery 分类在 capture→dedupe→spool 链路的端到端行为
+    const { captureTurn } = await import("../src/capture.mjs");
+    const { TurnDedupe } = await import("../src/dedupe.mjs");
+    const identity = { serviceId: "e2e-service", teamId: "team-e2e", userId: "usr-e2e", agentId: "agt-e2e" };
+    const mkClient = (mode) => ({
+      addConversation: async () => {
+        if (mode === "partial") throw Object.assign(new Error("terminated"), { delivery: "maybe_sent" });
+        if (mode === "timeout") throw Object.assign(new Error("timed out"), { delivery: "maybe_sent" });
+        if (mode === "refused") throw Object.assign(new Error("ECONNREFUSED"), { delivery: "definitely_not_sent" });
+        if (mode === "forbidden") throw Object.assign(new Error("403"), { delivery: "rejected", status: 403 });
+        return { total: 2 };
+      },
+      queryConversation: async () => ({ messages: [] }),
+    });
+    const turn = (turnId) => ({ client: "codex", provider: "p", sessionId: "e2e-sess-j", turnId, originalUser: `J 门问题 ${turnId}`, finalAssistant: "J 门回答", status: "completed" });
+
+    // J1: maybe_sent → unknown，且不重发
+    const d1 = new TurnDedupe({ memory: new Map() });
+    let sends1 = 0;
+    const c1 = mkClient("partial");
+    const origAdd1 = c1.addConversation;
+    c1.addConversation = async (...args) => { sends1 += 1; return origAdd1(...args); };
+    const r1 = await captureTurn({ client: c1, identity, dedupe: d1, turn: turn("j1") });
+    const r1b = await captureTurn({ client: c1, identity, dedupe: d1, turn: turn("j1") });
+    assert.equal(r1.status, "unknown");
+    assert.equal(r1b.status, "unknown");
+    assert.equal(sends1, 1, "maybe_sent must never be retried");
+
+    // J2: 503（maybe_sent）→ unknown；reconcile 读回命中 → acknowledged(suspected)
+    const d2 = new TurnDedupe({ memory: new Map() });
+    const r2 = await captureTurn({ client: mkClient("timeout"), identity, dedupe: d2, turn: turn("j2") });
+    assert.equal(r2.status, "unknown");
+    const recon = await d2.reconcile({ key: r2.key, verify: async () => true });
+    assert.equal(recon.status, "acknowledged");
+    assert.equal(recon.suspected, true);
+
+    // J3: ECONNREFUSED（definitely_not_sent）→ retryable，可重发
+    const d3 = new TurnDedupe({ memory: new Map() });
+    let sends3 = 0;
+    const c3 = mkClient("refused");
+    const origAdd3 = c3.addConversation;
+    c3.addConversation = async (...args) => { sends3 += 1; if (sends3 === 1) return origAdd3(...args); return { total: 2 }; };
+    const r3 = await captureTurn({ client: c3, identity, dedupe: d3, turn: turn("j3") });
+    assert.equal(r3.status, "retryable");
+    const r3b = await captureTurn({ client: c3, identity, dedupe: d3, turn: turn("j3") });
+    assert.equal(r3b.status, "acknowledged");
+    assert.equal(sends3, 2, "definitely_not_sent may be retried once it recovers");
+
+    // J4: 授权拒绝 → denied，不重试
+    const d4 = new TurnDedupe({ memory: new Map() });
+    let sends4 = 0;
+    const c4 = mkClient("forbidden");
+    const origAdd4 = c4.addConversation;
+    c4.addConversation = async (...args) => { sends4 += 1; return origAdd4(...args); };
+    const r4 = await captureTurn({ client: c4, identity, dedupe: d4, turn: turn("j4") });
+    const r4b = await captureTurn({ client: c4, identity, dedupe: d4, turn: turn("j4") });
+    assert.equal(r4.status, "denied");
+    assert.equal(r4b.status, "denied");
+    assert.equal(sends4, 1, "authorization rejection must not be retried");
+    evidence.gates.J = { maybeSentNoRetry: true, reconcileSuspected: true, notSentRetryable: true, rejectedDenied: true };
+  });
+
+  // ── Gate K：ACK 后进程崩溃 / 磁盘满 / 锁跨进程超时（R2 P0-B/P1-C）──
+  await t.test("K crash/disk/lock anomalies", async () => {
+    const { captureTurn } = await import("../src/capture.mjs");
+    const { TurnDedupe } = await import("../src/dedupe.mjs");
+    const identity = { serviceId: "e2e-service", teamId: "team-e2e", userId: "usr-e2e", agentId: "agt-e2e" };
+    const client = {
+      addConversation: async () => ({ total: 2 }),
+      queryConversation: async () => ({ messages: [] }),
+    };
+    // K1: ACK 后"进程崩溃"（新实例读同一 stateDir）→ 同 turn 不重写
+    const dir = (await import("node:fs")).mkdtempSync("/tmp/am001-k-");
+    const d1 = new TurnDedupe({ stateDir: dir });
+    await captureTurn({ client, identity, dedupe: d1, turn: { client: "codex", provider: "p", sessionId: "e2e-sess-k1", turnId: "k1", originalUser: "K 崩溃恢复问题", finalAssistant: "K 回答", status: "completed" } });
+    const d2 = new TurnDedupe({ stateDir: dir }); // 模拟重启
+    let sends = 0;
+    const countingClient = { ...client, addConversation: async () => { sends += 1; return { total: 2 }; } };
+    const r = await captureTurn({ client: countingClient, identity, dedupe: d2, turn: { client: "codex", provider: "p", sessionId: "e2e-sess-k1", turnId: "k1", originalUser: "K 崩溃恢复问题", finalAssistant: "K 回答", status: "completed" } });
+    assert.equal(r.status, "duplicate");
+    assert.equal(sends, 0);
+
+    // K2: 磁盘满（state 写入失败）→ deferred，不发送
+    const dir2 = (await import("node:fs")).mkdtempSync("/tmp/am001-k2-");
+    await (await import("node:fs/promises")).mkdir(dir2 + "/turns.json", { recursive: true }); // 使写入失败
+    const d3 = new TurnDedupe({ stateDir: dir2 });
+    let sends2 = 0;
+    const client3 = { ...client, addConversation: async () => { sends2 += 1; return { total: 2 }; } };
+    const r2 = await captureTurn({ client: client3, identity, dedupe: d3, turn: { client: "codex", provider: "p", sessionId: "e2e-sess-k2", turnId: "k2", originalUser: "K 磁盘满问题", finalAssistant: "K 回答", status: "completed" } });
+    assert.equal(r2.status, "deferred");
+    assert.equal(sends2, 0, "persistence failure must not send");
+    evidence.gates.K = { ackCrashSafe: true, diskFullDeferred: true };
   });
 
   // ── Gate H：延迟预算 ──

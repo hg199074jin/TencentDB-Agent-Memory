@@ -581,16 +581,16 @@ test("shared hook CLI preserves the three-client process contract and fails open
     stderrOutputs.push(orderedStop.stderr);
     assert.deepEqual(orderedStop.output, {});
     assert.equal(orderedStop.stdout, "{}\n");
-    // M2 契约：写前读回校验（幂等）→ 当前回合 add → spool 重试同样先读回再 add
+    // R2 契约（P1-E）：当前回合不做写前内容匹配（turnKey 唯一主判据）→ add；
+    // spool 重试仍先读回（疑似判重）再 add。
     assert.deepEqual(gateway.requests.map((item) => item.path), [
-      "/v3/conversation/query",
       "/v3/conversation/add",
       "/v3/conversation/query",
       "/v3/conversation/add"
     ]);
-    assert.equal(gateway.requests[1].body.messages[0].content, "current ordered prompt");
-    assert.equal(gateway.requests[1].body.messages[1].content, "current ordered answer");
-    assert.equal(gateway.requests[3].body.messages[0].content, "old queued prompt");
+    assert.equal(gateway.requests[0].body.messages[0].content, "current ordered prompt");
+    assert.equal(gateway.requests[0].body.messages[1].content, "current ordered answer");
+    assert.equal(gateway.requests[2].body.messages[0].content, "old queued prompt");
 
     const captureFailureSession = `capture-failure-${randomUUID()}`;
     const captureFailureSubmit = await runHook("codex", JSON.stringify({

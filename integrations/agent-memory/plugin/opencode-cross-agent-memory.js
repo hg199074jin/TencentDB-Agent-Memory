@@ -121,6 +121,22 @@ export const CrossAgentMemory = async (input) => {
         status: "completed",
       },
     });
+    // R2：unknown（maybe_sent）→ 做一次读回对账（内容命中仅"疑似"，不明示重发）
+    if (result.status === "unknown") {
+      try {
+        const existing = await built.coreClient.queryConversation({ sessionId: result.sessionId, limit: 100 });
+        const messages = Array.isArray(result.messages) ? result.messages : [];
+        const suspected = messages.length === 2 && messages.every((queued) =>
+          (existing?.messages ?? []).some((c) => c?.role === queued.role && c?.content === queued.content));
+        const reconciled = await built.dedupe.reconcile({ key: result.key, verify: async () => suspected });
+        if (reconciled.status === "acknowledged") {
+          result.status = "acknowledged";
+          result.reconciled = "suspected";
+        }
+      } catch (error) {
+        await log(`reconcile failed: ${error?.message ?? error}`);
+      }
+    }
     if (result.status !== "skipped") await log(`capture session=${sessionID} turn=${turnId} status=${result.status}`);
     return result;
   }
