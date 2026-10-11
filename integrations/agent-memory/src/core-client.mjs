@@ -80,8 +80,12 @@ function requiredString(value, field) {
   return value.trim();
 }
 
-/** 连接层错误码：请求确定未离开客户端。 */
-const NOT_SENT_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "ECONNABORTED"]);
+/**
+ * 连接层错误码：请求**确定未离开客户端**才可安全重试。
+ * 仅限连接建立前的失败（拒绝/DNS/路由）；ECONNABORTED/ECONNRESET 等可能发生在
+ * 发送中或发送后，一律保守按 maybe_sent（R3 修复：旧集合误含 ECONNABORTED）。
+ */
+const NOT_SENT_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH"]);
 
 export class CoreClient {
   constructor({

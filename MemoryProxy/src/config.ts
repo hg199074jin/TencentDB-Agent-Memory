@@ -524,6 +524,9 @@ export function buildConfig(overrides: CliOverrides = {}): ProxyConfig {
       enabled: yaml.auth?.enabled ?? DEFAULT_CONFIG.auth.enabled,
       url: yaml.auth?.url ?? DEFAULT_CONFIG.auth.url,
       timeoutMs: yaml.auth?.timeoutMs ?? DEFAULT_CONFIG.auth.timeoutMs,
+      // R3：auth/verify 的服务级 Bearer。缺省复用 tdai.apiKey —— 本地部署里它就是
+      // 与 Core 一致的 gateway 服务密钥（start-proxy.sh 用同一 env 注入）。
+      serviceBearer: yaml.auth?.serviceBearer ?? yaml.tdai?.apiKey ?? "",
     },
     // Entries without a non-empty userId are silently dropped — matching is
     // by userId now, and an empty userId would otherwise collide with

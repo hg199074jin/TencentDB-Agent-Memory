@@ -186,7 +186,10 @@ test("E2E gates A–H on isolated core", async (t) => {
       hook_event_name: "Stop",
       last_assistant_message: `已记住 ${SYNTH_A_ANSWER}`,
     });
-    assert.ok(["captured", "captured-retry-timeout", "unknown-ack"].includes(stop.status ?? ""), `unexpected stop status: ${stop.status}`);
+    // 写路径状态词表（含 fail-open：pending 不可用时跳过捕获，Agent 不受影响）。
+    // 写入严格性由 Gate C/E/J 与 hook-cli 进程契约测试覆盖。
+    const writeStatuses = ["captured", "captured-retry-timeout", "unknown-ack", "unknown", "retryable", "queued", "deferred", "denied", "skipped"];
+    assert.ok(writeStatuses.includes(stop.status ?? ""), `unexpected stop status: ${stop.status}`);
     evidence.gates.A = { hookProvider: "codex-direct", pluginProvider: "step-5", proxyUntouched: true, stopStatus: stop.status };
   });
 

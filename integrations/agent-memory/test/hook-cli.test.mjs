@@ -152,6 +152,20 @@ async function durableCaptureRecords() {
   return records;
 }
 
+async function drainAfterLegacyRemoved() {
+  // legacy（无 turnKey）记录在新契约下永远保留；为验证 turnKey 记录可重发，
+  // 这里清空 spool 后重新入队该 turnKey 记录（等价于运维清理 legacy 后的状态）。
+  await clearQueue();
+  await enqueueCapture({
+    memorySessionId: "codex-seeded-old-record",
+    turnKey: createHash("sha256").update("seeded-old-record").digest("hex").slice(0, 32),
+    messages: [
+      { role: "user", content: "old queued prompt", timestamp: "2026-08-08T00:00:00.000Z" },
+      { role: "assistant", content: "old queued answer", timestamp: "2026-08-08T00:00:01.000Z" }
+    ]
+  }, { runtimeDir });
+}
+
 async function clearQueue() {
   await rm(join(runtimeDir, "capture-queue.jsonl"), { force: true });
   await rm(join(runtimeDir, "capture-spool"), { recursive: true, force: true });
@@ -558,6 +572,9 @@ test("shared hook CLI preserves the three-client process contract and fails open
       { role: "assistant", content: "next final answer" }
     ]);
 
+    // R3：清空历史 spool（无 turnKey 的旧记录在新契约下会被保留，遇保留即停的
+    // drain 语义会阻塞后续记录 —— 保持本子测试确定性）
+    await clearQueue();
     const orderedSession = `ordered-${randomUUID()}`;
     const orderedSubmit = await runHook("codex", JSON.stringify({
       session_id: orderedSession,
@@ -565,8 +582,17 @@ test("shared hook CLI preserves the three-client process contract and fails open
       prompt: "current ordered prompt"
     }));
     stderrOutputs.push(orderedSubmit.stderr);
+    // R3 契约：无 turnKey 的历史记录只读回、保留、不重发；带 turnKey 的 pending 记录重发。
+    await enqueueCapture({
+      memorySessionId: "codex-seeded-legacy",
+      messages: [
+        { role: "user", content: "legacy queued prompt", timestamp: "2026-08-08T00:00:00.000Z" },
+        { role: "assistant", content: "legacy queued answer", timestamp: "2026-08-08T00:00:01.000Z" }
+      ]
+    }, { runtimeDir });
     await enqueueCapture({
       memorySessionId: "codex-seeded-old-record",
+      turnKey: createHash("sha256").update("seeded-old-record").digest("hex").slice(0, 32),
       messages: [
         { role: "user", content: "old queued prompt", timestamp: "2026-08-08T00:00:00.000Z" },
         { role: "assistant", content: "old queued answer", timestamp: "2026-08-08T00:00:01.000Z" }
@@ -581,16 +607,24 @@ test("shared hook CLI preserves the three-client process contract and fails open
     stderrOutputs.push(orderedStop.stderr);
     assert.deepEqual(orderedStop.output, {});
     assert.equal(orderedStop.stdout, "{}\n");
-    // R2 契约（P1-E）：当前回合不做写前内容匹配（turnKey 唯一主判据）→ add；
-    // spool 重试仍先读回（疑似判重）再 add。
+    // 当前回合 add（无写前内容匹配）→ legacy 记录 query 后保留（drain 停止）……
     assert.deepEqual(gateway.requests.map((item) => item.path), [
       "/v3/conversation/add",
-      "/v3/conversation/query",
-      "/v3/conversation/add"
+      "/v3/conversation/query"
     ]);
     assert.equal(gateway.requests[0].body.messages[0].content, "current ordered prompt");
     assert.equal(gateway.requests[0].body.messages[1].content, "current ordered answer");
-    assert.equal(gateway.requests[2].body.messages[0].content, "old queued prompt");
+    // ……带 turnKey 的记录在 legacy 记录被清理后才可重发（重新入队验证）
+    gateway.requests.length = 0;
+    await drainAfterLegacyRemoved();
+    const afterCleanup = await runHook("codex", JSON.stringify({
+      session_id: "cleanup-trigger-session",
+      hook_event_name: "Stop",
+      last_assistant_message: "cleanup trigger"
+    }));
+    stderrOutputs.push(afterCleanup.stderr);
+    assert.ok(gateway.requests.some((item) => item.path === "/v3/conversation/add" && item.body.messages[0].content === "old queued prompt"),
+      "turnKey record must be resent once the legacy record is out of the way");
 
     const captureFailureSession = `capture-failure-${randomUUID()}`;
     const captureFailureSubmit = await runHook("codex", JSON.stringify({

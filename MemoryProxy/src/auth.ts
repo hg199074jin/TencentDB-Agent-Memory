@@ -41,6 +41,15 @@ export function initAuth(cfg: AuthConfig): void {
     config = null;
     return;
   }
+  if (!cfg.serviceBearer) {
+    // R3：Core 启用强 Bearer 时，缺少服务级凭据会让每一次 verify 都以 401 收场。
+    // 高可见告警，绝不静默降级。
+    log.warn("auth.init.noServiceBearer", {
+      reason: "auth.serviceBearer is empty; auth/verify will fail against a Core with TDAI_GATEWAY_API_KEY set",
+      hint: "set auth.serviceBearer (or tdai.apiKey) to the Core gateway service key",
+    });
+    return;
+  }
   config = cfg;
   log.info("auth.init", { url: cfg.url });
 }
@@ -73,12 +82,17 @@ export async function verifyUserKey(userKey: string, serviceId: string): Promise
   if (!userKey) return { userId: "", rejected: true, rejectReason: "missing user_key" };
 
   try {
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-tdai-service-id": serviceId,
+    };
+    // R3：服务级 Gateway Bearer。client user_key 只进 body，绝不冒充服务凭据。
+    if (config.serviceBearer) {
+      headers.Authorization = `Bearer ${config.serviceBearer}`;
+    }
     const fetchOpts: RequestInit = {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-tdai-service-id": serviceId,
-      },
+      headers,
       body: JSON.stringify({ user_key: userKey }),
     };
     if (config.timeoutMs > 0) {

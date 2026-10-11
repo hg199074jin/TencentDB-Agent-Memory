@@ -691,6 +691,16 @@ export interface AuthConfig {
   url: string;
   /** Request timeout in ms. Default: 5000. */
   timeoutMs: number;
+  /**
+   * Service-level Gateway Bearer for auth/verify calls.
+   *
+   * Memory Core with `TDAI_GATEWAY_API_KEY` set rejects every request without
+   * `Authorization: Bearer <key>` (R3). This field carries the **service**
+   * credential only — never a client user_key or an upstream LLM key.
+   * Empty = legacy local deployments (Core auth disabled) — a high-visibility
+   * WARN is emitted at startup in that case.
+   */
+  serviceBearer?: string;
 }
 
 /**

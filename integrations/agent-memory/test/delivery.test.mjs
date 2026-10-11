@@ -171,3 +171,57 @@ const ENV = {
   assert.equal(receipt.status, "denied", `authorization rejection must be denied, got ${receipt.status}`);
   console.log("DA7 capture surfaces denied on authorization rejection: PASS");
 }
+
+// ── R3 RED pins：网络状态分类 ───────────────────────────────────────────────
+
+// DB-R1: ECONNABORTED（连接中断）不能证明未送达 → maybe_sent
+{
+  const fetchImpl = mockFetch(() => {
+    throw Object.assign(new Error("fetch failed"), { cause: { code: "ECONNABORTED" } });
+  });
+  const client = new CoreClient({ ...ENV, fetchImpl });
+  await assert.rejects(() => client.readCore(), (error) => {
+    assert.equal(error.delivery, "maybe_sent", `ECONNABORTED must be maybe_sent, got ${error.delivery}`);
+    return true;
+  });
+  console.log("DB-R1 ECONNABORTED → maybe_sent: PASS");
+}
+
+// DB-R2: 复合 cause（cause 为对象但无 code）→ 保守 maybe_sent
+{
+  const fetchImpl = mockFetch(() => {
+    throw Object.assign(new Error("fetch failed"), { cause: new Error("socket hang up") });
+  });
+  const client = new CoreClient({ ...ENV, fetchImpl });
+  await assert.rejects(() => client.readCore(), (error) => {
+    assert.equal(error.delivery, "maybe_sent", `unknown transport failure must be maybe_sent, got ${error.delivery}`);
+    return true;
+  });
+  console.log("DB-R2 opaque transport failure → maybe_sent: PASS");
+}
+
+// DB-R3: DNS 失败（解析阶段，请求未发出）→ definitely_not_sent
+{
+  const fetchImpl = mockFetch(() => {
+    throw Object.assign(new Error("fetch failed"), { cause: { code: "ENOTFOUND" } });
+  });
+  const client = new CoreClient({ ...ENV, fetchImpl });
+  await assert.rejects(() => client.readCore(), (error) => {
+    assert.equal(error.delivery, "definitely_not_sent", `ENOTFOUND must be definitely_not_sent, got ${error.delivery}`);
+    return true;
+  });
+  console.log("DB-R3 ENOTFOUND → definitely_not_sent: PASS");
+}
+
+// DB-R4: 连接拒绝 → definitely_not_sent（原有行为不回退）
+{
+  const fetchImpl = mockFetch(() => {
+    throw Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+  });
+  const client = new CoreClient({ ...ENV, fetchImpl });
+  await assert.rejects(() => client.readCore(), (error) => {
+    assert.equal(error.delivery, "definitely_not_sent");
+    return true;
+  });
+  console.log("DB-R4 ECONNREFUSED → definitely_not_sent: PASS");
+}

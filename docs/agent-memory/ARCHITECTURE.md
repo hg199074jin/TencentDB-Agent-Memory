@@ -91,8 +91,26 @@ deferred）；恢复自动清除。不同 key 并发更新不相互覆盖。
 结构化 reason（不悄悄截断）；`readScenario({path})`、`listScenarios({path_prefix})`
 与官方 SDK 逐字段一致。
 
+**跨进程状态保护（R3 新增）**：`turns.json` merge-on-write 只合并本进程 dirtyKeys；
+终态（acknowledged/denied/unknown）永不被非终态回退（终态间按秩）；非 dirty key 用
+磁盘终态刷新内存；状态文件解析失败（非 ENOENT）→ corrupted → 一律 deferred。
+**spool 契约（R3 新增）**：队列记录强制 turnKey；只有该 key 的 durable ACK 自动出队；
+unknown 仅报告 suspected；无 key 历史记录保留不重发。
+
+**部署门禁（R3 新增）**：`ops/loopback-guard.sh` 为上线前置检查——四端口必须且只能
+绑 127.0.0.1、容器 healthy、启动脚本实际发布 loopback（解析 `-p` 参数而非 grep 字样）；
+缺端口/多端口/IPv6 通配/stopped/脚本缺失/假覆盖/注释命中/未批准额外端口一律 FAIL。
+
 无 server-side idempotency 时，本实现为**客户端最佳努力幂等**（client best-effort
 idempotency），不宣称全局 exactly-once。
+
+## 8. Gateway 强 Bearer 与身份绑定（R3 结论）
+
+- Proxy 对 Core 的调用中，仅 `verifyUserKey` 缺服务级 Bearer（R3 已修：`auth.serviceBearer`，
+  缺省复用 `tdai.apiKey`）；tdai/skill/knowledge/Hub 均已具备 Bearer 能力。
+- Core 数据面**不校验** `x-tdai-user-key` 与 body 身份的所有权（R3 隔离实测五类越权全部
+  允许，含伪造写 L0 落库）——属上游架构级缺口，最小兼容方案见 `PROD-AUTH-ROLLOUT.md` §4。
+- 上线顺序与回滚边界见 `PROD-AUTH-ROLLOUT.md`（仅预案，未执行）。
 
 | 状态 | 含义 | 迁移 |
 | --- | --- | --- |

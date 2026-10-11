@@ -46,6 +46,9 @@ const WRITE_LOCK_WAIT_MS = 2_000;
 /** 内存模式哨兵：#acquireLock 在无 stateDir 时返回它，表示"无需持锁"。 */
 const MEMORY_MODE = "memory-mode";
 
+const TERMINAL_RANK = { acknowledged: 3, denied: 2, unknown: 1 };
+const isTerminal = (state) => Object.prototype.hasOwnProperty.call(TERMINAL_RANK, state);
+
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -62,6 +65,8 @@ export class TurnDedupe {
     this.memory = memory instanceof Map ? memory : new Map();
     this.maxTracked = maxTracked;
     this.degraded = false; // 持久化失败后置位；恢复成功清除
+    this.corrupted = false; // 状态文件损坏（非 ENOENT）：fail-closed，禁止发送
+    this.dirtyKeys = new Set(); // 本进程自上次持久化以来修改过的 key（merge-on-write 只写这些）
     this.token = createHash("sha256").update(`${process.pid}-${Date.now()}-${Math.random()}`).digest("hex").slice(0, 12);
     if (stateDir) {
       try {
@@ -69,8 +74,12 @@ export class TurnDedupe {
         for (const [key, entry] of Object.entries(parsed ?? {})) {
           if (entry && typeof entry.state === "string") this.memory.set(key, entry);
         }
-      } catch {
-        /* 首次运行或损坏：从空开始 */
+      } catch (error) {
+        // ENOENT = 首次运行（正常）；其余（解析失败/权限）→ 损坏，fail-closed
+        if (error?.code !== "ENOENT") {
+          this.corrupted = true;
+          this.degraded = true;
+        }
       }
     }
   }
@@ -123,16 +132,38 @@ export class TurnDedupe {
     }
     try {
       await mkdir(this.stateDir, { recursive: true });
-      // merge-on-write：读入磁盘最新状态，合并本进程 entries（本进程写入优先），
-      // 避免不同 key 的并发进程相互覆盖。
+      // 读入磁盘最新状态；损坏（非 ENOENT）→ fail-closed
       let onDisk = {};
       try {
         onDisk = JSON.parse(await readFile(join(this.stateDir, "turns.json"), "utf8")) ?? {};
-      } catch {
-        onDisk = {};
+      } catch (error) {
+        if (error?.code !== "ENOENT") {
+          this.corrupted = true;
+          this.degraded = true;
+          return false;
+        }
       }
+      // merge-on-write（R3 修复）：只合并**本进程修改过的 key**，
+      // 且终态（acknowledged/denied/unknown）永不被非终态覆盖；
+      // 同时用磁盘较新的终态刷新本进程内存，避免旧内存日后回写。
       const merged = { ...onDisk };
-      for (const [key, entry] of this.memory) merged[key] = entry;
+      for (const key of this.dirtyKeys) {
+        const ours = this.memory.get(key);
+        if (!ours) continue;
+        const disk = onDisk[key];
+        if (disk && isTerminal(disk.state)) {
+          if (!isTerminal(ours.state)) continue; // 终态不被回退
+          if (TERMINAL_RANK[disk.state] > TERMINAL_RANK[ours.state]) continue; // 更强终态优先
+        }
+        merged[key] = ours;
+      }
+      for (const [key, entry] of Object.entries(onDisk)) {
+        if (this.dirtyKeys.has(key)) continue;
+        const current = this.memory.get(key);
+        if (!current || (isTerminal(entry.state) && !isTerminal(current.state))) {
+          this.memory.set(key, entry); // 吸收他进程的更新，防止本进程旧值随后回写
+        }
+      }
       const kept = Object.entries(merged)
         .sort(([, a], [, b]) => String(a.updatedAt ?? "").localeCompare(String(b.updatedAt ?? "")))
         .slice(-this.maxTracked);
@@ -141,6 +172,7 @@ export class TurnDedupe {
       await writeFile(tmp, JSON.stringify(payload));
       await rename(tmp, join(this.stateDir, "turns.json"));
       this.degraded = false;
+      this.dirtyKeys.clear();
       return true;
     } catch {
       this.degraded = true;
@@ -151,6 +183,7 @@ export class TurnDedupe {
   }
 
   async #set(key, state, extra = {}) {
+    this.dirtyKeys.add(key);
     this.memory.set(key, {
       state,
       attempts: (this.memory.get(key)?.attempts ?? 0) + 1,
@@ -279,6 +312,7 @@ export class TurnDedupe {
    *     delivery='rejected' / 其它 → denied（不重试）
    */
   async execute({ key, sessionId, messages, send }) {
+    if (this.corrupted) return { status: "deferred", reason: "state-file-corrupted" };
     if (this.degraded) return { status: "deferred", reason: "persistence-degraded" };
 
     const quick = this.stateOf(key);

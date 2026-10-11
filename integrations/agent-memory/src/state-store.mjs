@@ -279,6 +279,11 @@ function normalizeCapture(record) {
     messages: cleanMessages(record?.messages),
     queuedAt: typeof record?.queuedAt === "string" ? record.queuedAt : new Date().toISOString()
   };
+  // R3：幂等 turnKey 必须随队列持久化（旧版白名单丢弃它，导致 spool 记录退化为
+  // "无 key 历史记录"，只能按内容疑似保留——无法真实重试）。
+  if (typeof record?.turnKey === "string" && /^[0-9a-f]{32}$/.test(record.turnKey)) {
+    core.turnKey = record.turnKey;
+  }
   const digest = sha256(JSON.stringify({ memorySessionId: core.memorySessionId, messages: core.messages }));
   return { ...core, digest };
 }

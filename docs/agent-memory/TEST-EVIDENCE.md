@@ -121,3 +121,35 @@ npm run test:e2e   → 12 测试全绿（gates A–K；镜像固定 digest sha25
 - 生产 `tdai-*` 三容器全程未停未改（E2E 前后 health/uptime 一致）。
 - 合成语料 `AM001-SYNTH-*`/`AM001-PRIV-*`/`AM001-DISTILL-*`/`AM001-INJECTED*`，与生产 5200+ L0 无交集。
 - 测试日志不打印生产密钥或真实 L0（E2E 仅从 `.env` 读取 LLM 配置注入隔离容器环境变量）。
+
+## 5. R3 证据（2026-10-11）
+
+### 5.1 规模
+
+```
+integrations/agent-memory  → 21 套 / 130 断言全绿（node --test test/*.test.mjs）
+ops/test/loopback-guard    → 11 mock-docker 用例全绿
+ops/e2e/run-r3-security-e2e.sh → 隔离全栈 RED/GREEN/负向/M4 全符合预期
+```
+
+### 5.2 R3 新增 pins
+
+| 套件 | pin | 断言要点 |
+| --- | --- | --- |
+| r3-spool | SA1/SA2/SA3 | 同内容不同 turn 两组都写；unknown 不重发且内容匹配不自动 ACK；legacy 无 key 记录保留 |
+| delivery（追加） | DB-R1–R4 | ECONNABORTED/复合 cause→maybe_sent；ENOTFOUND/ECONNREFUSED→definitely_not_sent |
+| r3-crossproc | DC-R1–R4 | 陈旧 pending 不覆盖 acknowledged（修复前实测复现回退）；unknown 不被 sending 回退；损坏文件 fail-closed；磁盘不可写降级 |
+| loopback-guard（mock） | G1–G11 | 精确四端口/缺端口/通配/IPv6/stopped/脚本缺失/注释假命中/错误 override/额外端口/批准额外端口/无端口发布 |
+
+### 5.3 隔离安全 E2E（ops/e2e/run-r3-security-e2e.sh）
+
+| 步骤 | 预期 | 实测 |
+| --- | --- | --- |
+| 强 Bearer Core 拒错 Bearer | 401 | 401 ✓ |
+| M4 五类越权 | 全部 allowed=true（敞口 RED） | ✓（含伪造写 L0 落库实证） |
+| Proxy RED（未打补丁 auth.ts） | 401 | 401 "auth service returned HTTP 401" ✓ |
+| Proxy GREEN（R3 补丁 + 服务 Bearer） | 200 + 上游 | ✓ |
+| 负向 ×3（错服务 Bearer/缺 user key/错 user key） | 401 | ✓ |
+
+镜像固定：core `sha256:338847edc646…`、proxy `sha256:82df81d8af89…`（挂载源码运行，非重建镜像）。
+隔离容器/卷/网络在脚本退出时清理（trap EXIT，含失败路径）。

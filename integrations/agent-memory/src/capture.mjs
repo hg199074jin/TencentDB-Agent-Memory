@@ -126,7 +126,7 @@ export async function retryQueuedCaptures({
 }) {
   const startedAt = Date.now();
   const hasBudget = () => Date.now() - startedAt < retryBudgetMs && Date.now() < deadline;
-  const stats = { resent: 0, droppedSuspected: 0, droppedAck: 0, keptUnknown: 0, droppedRejected: 0 };
+  const stats = { resent: 0, droppedSuspected: 0, droppedAck: 0, keptUnknown: 0, droppedRejected: 0, suspectedLegacy: 0, suspectedUnknown: 0, suspectedResend: 0 };
 
   const readBack = async (record) => {
     try {
@@ -143,32 +143,39 @@ export async function retryQueuedCaptures({
     async (record) => {
       if (!hasBudget()) return false;
       const key = record?.turnKey;
-      const state = key ? dedupe.stateOf(key) : undefined;
 
+      // R3 契约：队列记录**强制 turnKey**。无 key 的历史记录无法证明归属，
+      // 内容匹配只能报告"疑似"，绝不出队、绝不盲发（保留待人工/迁移处理）。
+      if (!key) {
+        const suspected = await readBack(record);
+        if (suspected === true) stats.suspectedLegacy += 1;
+        stats.keptUnknown += 1;
+        return false;
+      }
+
+      const state = dedupe.stateOf(key);
       if (state === "acknowledged") {
         stats.droppedAck += 1;
-        return true;
+        return true; // 只有该 key 的真实 durable ACK 才自动出队
       }
       if (state === "denied") {
         stats.droppedRejected += 1;
         return true;
       }
-
-      const suspected = await readBack(record);
-      if (suspected === true) {
-        if (key) await dedupe.markAcknowledged(key, { via: "spool-read-back-suspected" });
-        stats.droppedSuspected += 1;
-        return true;
-      }
-      if (state === "unknown" || suspected === null) {
-        // unknown/读回失败：保留在队列等待后续对账，绝不盲发
+      if (state === "unknown") {
+        const suspected = await readBack(record);
+        if (suspected === true) stats.suspectedUnknown += 1; // 仅报告，不升级、不删除
         stats.keptUnknown += 1;
         return false;
       }
 
+      // pending / 无状态：读回仅作参考信息（不得因疑似跳过发送——同内容不同 turn 是真实历史）
+      const suspected = await readBack(record);
+      if (suspected === true) stats.suspectedResend += 1;
+
       try {
         await coreClient.addConversation({ sessionId: record.memorySessionId, messages: record.messages });
-        if (key) await dedupe.markAcknowledged(key, { via: "spool-retry" });
+        await dedupe.markAcknowledged(key, { via: "spool-retry" });
         stats.resent += 1;
         return true;
       } catch (error) {
@@ -177,10 +184,10 @@ export async function retryQueuedCaptures({
           stats.droppedRejected += 1;
           return true; // 明确拒绝：出队（保留会是死循环）
         }
-        if (delivery === "maybe_sent" && key) {
+        if (delivery === "maybe_sent") {
           await dedupe.markUnknown(key, { via: "spool-retry-unknown" });
         }
-        return false; // definitely_not_sent：保留等下次
+        return false; // definitely_not_sent / unknown：保留等下次
       }
     },
     { runtimeDir },
